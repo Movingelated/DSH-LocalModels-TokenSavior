@@ -1,0 +1,7 @@
+# 统一换行：仓库内一律 LF，避免 Windows 用户 checkout 后产生整文件 diff
+* text=auto eol=lf
+
+# 二进制（万一以后加图片）
+*.png binary
+*.jpg binary
+*.ico binary

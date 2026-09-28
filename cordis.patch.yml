@@ -1,0 +1,24 @@
+# 本地 Ollama 模型 —— 插件行声明（宿主侧）
+#
+# 开关方式：DSH 官方「插件」设置页里停用/启用本 bundle —— 框架保证的实时机制，
+#          停用后本行不激活，两个工具都从工具表消失。
+#
+# config 字段：
+#   enabled  → 是否启用委派工具（默认 false：装上先只提供只读状态查询）
+#   model    → 默认使用的本地模型 id（必须已写进下面 provider 路由的 models 列表）
+#   baseURL  → 可选端点覆盖（留空读 OLLAMA_HOST，再退回 127.0.0.1:11434）
+#   toolName → 委派工具名
+#   provider → 委派走的 DSH provider 路由名（须与 llm-pi-ai 里声明的路由一致）
+#
+# ⚠ 前置条件：本 bundle **不含** provider 路由。没有路由，委派一定失败 ——
+#    路由声明（llm-pi-ai → providers.ollama-local）与凭据占位符见同目录 README.md §2.2 / §2.3。
+# 最优用法、验收纪律、排错表：见同目录 README.md。
+- insert:
+    - id: local-ollama-models
+      name: '@local/dsh-local-ollama-models'
+      config:
+        enabled: false
+        model: ''
+        baseURL: ''
+        toolName: subagent_local
+        provider: ollama-local
