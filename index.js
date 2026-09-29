@@ -45,20 +45,24 @@ const README_PATH = PLUGIN_DIR ? path.join(PLUGIN_DIR, 'README.md') : 'README.md
 export const CALIBRATION_PATH =
   String(process.env.DSH_LOCAL_OLLAMA_CALIBRATION ?? '').trim() ||
   (PLUGIN_DIR ? path.join(PLUGIN_DIR, 'calibration.json') : 'calibration.json')
-const CALIBRATION_SCHEMA = 1
+const CALIBRATION_SCHEMA = 2
 
 /**
- * 读并校验校准标识 —— **标识是 AI 的自述，不是证明**，所以插件不信它，只读它、校验它：
- *  · 文件不在 → missing；JSON 坏了 / schema 不对 → invalid
- *  · provider / model / contextWindow 与当前不一致 → **stale**（换模型必须重校准，否则"大模型配小参数"）
- * 返回 { state: 'calibrated' | 'stale' | 'missing' | 'invalid', data?, reason? }
+ * 读并校验校准标识 —— **标识是 AI 的自述，不是证明**，所以插件只读它、校验它。
+ *
+ * v1.10.1 起是**多档案**：同一台机器可以给每个模型各存一份，键 = `${provider}::${model}`。
+ * 于是"换模型要重校准、换回来直接用"成立：A 校准过 → 切 B 要校准 → **切回 A 直接用旧档案**。
+ * 返回 { state, profile?, keys?, reason? }
+ *   · 文件不在 → missing；JSON 坏 / schema 不识 → invalid
+ *   · **本模型**没有档案 → missing（reason 说明本机已有几份别的档案）
+ *   · 有档案但 contextWindow 与当前声明不一致 → stale（**只废掉这一份**）
  */
 export async function readCalibration(expected = {}) {
   let raw = ''
   try {
     raw = await readFile(CALIBRATION_PATH, 'utf8')
   } catch {
-    return { state: 'missing' }
+    return { state: 'missing', reason: '插件目录里还没有 calibration.json' }
   }
   let data = null
   try {
@@ -67,23 +71,52 @@ export async function readCalibration(expected = {}) {
     return { state: 'invalid', reason: 'JSON 解析失败' }
   }
   if (!data || typeof data !== 'object') return { state: 'invalid', reason: '顶层不是对象' }
-  if (data.schema !== CALIBRATION_SCHEMA) {
-    return { state: 'invalid', reason: `schema=${String(data.schema)}（期望 ${CALIBRATION_SCHEMA}）` }
+
+  // schema 1（v1.10.0 的单档案格式）兼容读：把那条包成一份档案
+  let profiles = null
+  if (data.schema === CALIBRATION_SCHEMA) {
+    profiles = data.profiles && typeof data.profiles === 'object' ? data.profiles : {}
+  } else if (data.schema === 1 && data.model) {
+    profiles = { [`${data.provider ?? ''}::${data.model}`]: data }
+  } else {
+    return {
+      state: 'invalid',
+      reason: `schema=${String(data.schema)}（期望 ${CALIBRATION_SCHEMA}；1 是旧版单档案格式）`,
+    }
   }
+
+  const keys = Object.keys(profiles)
   const expModel = String(expected.model ?? '').trim()
   const expProvider = String(expected.provider ?? '').trim()
-  if (expModel && data.model && String(data.model) !== expModel) {
-    return { state: 'stale', data, reason: `校准的是 "${data.model}"，当前模型是 "${expModel}"` }
+  if (!expModel) return { state: 'missing', keys, reason: '当前没有配置模型，无法查档案' }
+
+  const key = `${expProvider}::${expModel}`
+  let profile = profiles[key]
+  if (!profile) {
+    // 容错：档案可能是别的路由（或旧版没写 provider）写的 —— 按模型 id 兜底找一次
+    const hit = Object.entries(profiles).find(([k]) => k.endsWith(`::${expModel}`))
+    profile = hit?.[1]
   }
-  if (expProvider && data.provider && String(data.provider) !== expProvider) {
-    return { state: 'stale', data, reason: `校准的路由是 "${data.provider}"，当前是 "${expProvider}"` }
+  if (!profile || typeof profile !== 'object') {
+    return {
+      state: 'missing',
+      keys,
+      reason: keys.length
+        ? `本机已有 ${keys.length} 个模型的档案，但没有 "${key}"`
+        : `本机还没有任何模型的档案（缺 "${key}"）`,
+    }
   }
   const expCtx = Number(expected.contextWindow)
-  const gotCtx = Number(data.capacity?.contextWindow)
+  const gotCtx = Number(profile.capacity?.contextWindow)
   if (Number.isFinite(expCtx) && expCtx > 0 && Number.isFinite(gotCtx) && gotCtx !== expCtx) {
-    return { state: 'stale', data, reason: `校准的上下文 ${gotCtx} ≠ 当前声明的 ${expCtx}` }
+    return {
+      state: 'stale',
+      profile,
+      keys,
+      reason: `"${key}" 的档案记的是上下文 ${gotCtx}，当前声明 ${expCtx} → 只废掉这一份`,
+    }
   }
-  return { state: 'calibrated', data }
+  return { state: 'calibrated', profile, keys }
 }
 
 /** 读模型声明的上下文窗口（拿不到就返回 null —— 不猜）。 */
@@ -102,22 +135,24 @@ function calibrationTemplate() {
   return JSON.stringify(
     {
       schema: CALIBRATION_SCHEMA,
-      calibratedAt: '<ISO 时间>',
-      calibratedBy: '<DSH 会话 / 模型>',
-      provider: '<路由，如 ollama-local>',
-      model: '<模型 id>',
-      env: { endpoint: '<端点>', ollamaVersion: '<版本>', gpu: '<显卡>', vramGB: 0 },
-      capacity: { contextWindow: 32768, maxChars: 60000, chunkLines: 40, maxRows: 12 },
-      evidence: {
-        throughputTokPerSec: 0,
-        appetiteProbe: [
-          { lines: 30, recall: 0 },
-          { lines: 60, recall: 0 },
-          { lines: 120, recall: 0 },
-        ],
-        kinds: { classify: 'untested', qa: 'untested', extract: 'untested', summary: 'untested', code: 'untested' },
+      profiles: {
+        '<provider>::<模型 id>': {
+          calibratedAt: '<ISO 时间>',
+          calibratedBy: '<DSH 会话 / 模型>',
+          env: { endpoint: '<端点>', ollamaVersion: '<版本>', gpu: '<显卡>', vramGB: 0 },
+          capacity: { contextWindow: 32768, maxChars: 60000, chunkLines: 40, maxRows: 12 },
+          evidence: {
+            throughputTokPerSec: 0,
+            appetiteProbe: [
+              { lines: 30, recall: 0 },
+              { lines: 60, recall: 0 },
+              { lines: 120, recall: 0 },
+            ],
+            kinds: { classify: 'untested', qa: 'untested', extract: 'untested', summary: 'untested', code: 'untested' },
+          },
+          notes: '',
+        },
       },
-      notes: '',
     },
     null,
     2,
@@ -126,20 +161,21 @@ function calibrationTemplate() {
 
 /** 校准状态段落（**免费通道**：改这里不砸 prompt 前缀缓存）。 */
 export function renderCalibration(cal, ctxWindow = null) {
+  const keys = Array.isArray(cal.keys) ? cal.keys : []
   if (cal.state === 'calibrated') {
-    const c = cal.data.capacity ?? {}
+    const c = cal.profile?.capacity ?? {}
     return (
-      '[校准] ✅ 已校准' +
-      `（${cal.data.calibratedAt ?? '时间未知'}，模型 ${cal.data.model ?? '?'}）\n` +
+      `[校准] ✅ **本模型**已有档案（${cal.profile?.calibratedAt ?? '时间未知'}）\n` +
       `  容量：上下文 ${c.contextWindow ?? '?'} / 素材上限 ${c.maxChars ?? '?'} 字符 / 一口 ${c.chunkLines ?? '?'} 行 / 输出 ${c.maxRows ?? '?'} 行\n` +
+      `  本机档案（${keys.length}）：${keys.join('、')}\n` +
       '  这些值会作为**默认参数**生效（调用时显式传参仍可覆盖）。'
     )
   }
   const why =
     cal.state === 'missing'
-      ? '⚠️ 未校准'
+      ? '⚠️ 本模型还没有档案'
       : cal.state === 'stale'
-        ? `⚠️ 标识已过期（${cal.reason}）`
+        ? `⚠️ 本模型的档案已过期（${cal.reason}）`
         : `⚠️ 标识不可用（${cal.reason}）`
   const suggestion =
     ctxWindow && ctxWindow > 8192
@@ -147,8 +183,10 @@ export function renderCalibration(cal, ctxWindow = null) {
       : ''
   return (
     `[校准] ${why} —— 当前按**保守默认**运行（素材上限 60000 字符；一口行数取当前模式的阈值 40~120 行）。\n` +
-    `  建议先做一次「四步容量校准」（步骤见 README §5.7），然后把结果 JSON 写到：\n  ${CALIBRATION_PATH}\n` +
-    '  模板（照抄改值；**模型或上下文一变就必须重校准**）：\n' +
+    `  本机已有档案：${keys.length ? keys.join('、') : '（无）'}\n` +
+    `  建议给**当前模型**做一次「四步容量校准」（步骤见 README §5.7），然后把这一条档案写进：\n  ${CALIBRATION_PATH}\n` +
+    '  ⚠️ 写入时**先读再合并**：只新增/更新本模型那一条，**不要覆盖其它模型的档案**（换了模型再换回来就不用重跑）。\n' +
+    '  模板（照抄改值；模型或上下文一变只需重校这一个模型）：\n' +
     calibrationTemplate()
       .split('\n')
       .map((l) => '  ' + l)
@@ -539,8 +577,9 @@ const DELEGATION_POLICY =
   '素材 > 32K token（≈100 KB）时**必须**先收窄：最有效的做法是先用 grep / pwsh 把大素材**去重归一化**成小文件再交给它' +
   '（实测 1.7 MB → 84 行），或者让 collect.pattern 只取匹配行 —— 本地模型只有 32K 上下文，整份塞进去会被截成残料。\n' +
   '**换机器/换模型后首次使用前**：先按插件 README §5.7 跑一遍「四步容量校准」（读上下文窗口 / 量吞吐 / 三点测"一口多少行" / 测哪几种 kind 可用），' +
-  '把结果 JSON 写进插件目录的 calibration.json；**若该文件已存在且模型与上下文未变，直接用里面的参数，不要重复校准**' +
-  '（ollama_local_models 的输出会显示当前校准状态）。\n' +
+  '把结果写进插件目录的 calibration.json（**先读再合并**，只动本模型那一条）；' +
+  '**若该文件里已有本模型的档案且上下文未变，直接用里面的参数、不要重复校准** —— ' +
+  '同机换模型只需给新模型校准，**换回来直接用旧档案**（ollama_local_models 的输出会显示本模型的档案状态）。\n' +
   '派法：subagent_local({ kind, task, collect })，collect 给绝对路径；拿回结论后按插件 README §6 复核' +
   '（**分类与行号可信，计数必须自己数**）。若手上没有 subagent_local 工具、或它报"已关闭"，就照常自己读文件，忽略本节。'
 
@@ -940,16 +979,24 @@ export function apply(ctx, rawConfig) {
         const tuned =
           cal.state === 'calibrated'
             ? {
-                maxChars: Number(cal.data.capacity?.maxChars) > 0 ? Number(cal.data.capacity.maxChars) : mode.maxChars,
-                chunkLines: Number(cal.data.capacity?.chunkLines) >= 0 ? Number(cal.data.capacity.chunkLines) : mode.chunkLines,
-                maxRows: Number(cal.data.capacity?.maxRows) > 0 ? Number(cal.data.capacity.maxRows) : mode.maxRows,
+                maxChars:
+                  Number(cal.profile.capacity?.maxChars) > 0 ? Number(cal.profile.capacity.maxChars) : mode.maxChars,
+                chunkLines:
+                  Number(cal.profile.capacity?.chunkLines) >= 0
+                    ? Number(cal.profile.capacity.chunkLines)
+                    : mode.chunkLines,
+                maxRows: Number(cal.profile.capacity?.maxRows) > 0 ? Number(cal.profile.capacity.maxRows) : mode.maxRows,
               }
             : { maxChars: mode.maxChars, chunkLines: mode.chunkLines, maxRows: mode.maxRows }
         const capacityNote =
           cal.state === 'calibrated'
-            ? `[容量] 已校准（模型 ${cal.data.model}）：上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines || '不分批'} 行 / 输出 ${tuned.maxRows} 行`
+            ? `[容量] 已校准（模型 ${now.model}）：上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines || '不分批'} 行 / 输出 ${tuned.maxRows} 行`
             : `[容量] ${
-                cal.state === 'missing' ? '未校准' : cal.state === 'stale' ? `标识已过期（${cal.reason}）` : `标识不可用（${cal.reason}）`
+                cal.state === 'missing'
+                  ? `本模型未校准（${cal.reason}）`
+                  : cal.state === 'stale'
+                    ? `本模型档案已过期（${cal.reason}）`
+                    : `标识不可用（${cal.reason}）`
               } → 按保守默认（上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines} 行）；建议先跑 README §5.7 的四步校准`
         // 任务类型（v1.8.0）：不认识的名字直接报错，不悄悄回退成 classify
         const kindRaw = String(args?.kind ?? '').trim()
