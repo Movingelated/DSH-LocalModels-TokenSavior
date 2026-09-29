@@ -55,6 +55,9 @@ const CALIBRATION_SCHEMA = 2
  * 那是模型的属性、不是机器的属性；同名同 digest 的模型换台机器跑，参数依然成立，
  * 强制重跑只会白花 5-8 分钟（跟"换模型要校准、换回来直接用"是同一个道理）。
  */
+/** 代码指纹缓存（懒算：读自身源码算 sha256 前 8 位，用来判断宿主跑的是哪一版代码）。 */
+let codeFingerprint = null
+
 export const MACHINE_HASH = (() => {  try {
     const raw = `${os.hostname?.() ?? ''}|${os.platform?.() ?? ''}|${os.arch?.() ?? ''}|${process.env.COMPUTERNAME ?? ''}|${process.env.USERNAME ?? ''}`
     return createHash('sha256').update(raw).digest('hex').slice(0, 12)
