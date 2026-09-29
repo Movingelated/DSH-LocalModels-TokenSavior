@@ -55,8 +55,7 @@ const CALIBRATION_SCHEMA = 2
  * 那是模型的属性、不是机器的属性；同名同 digest 的模型换台机器跑，参数依然成立，
  * 强制重跑只会白花 5-8 分钟（跟"换模型要校准、换回来直接用"是同一个道理）。
  */
-export const MACHINE_HASH = (() => {
-  try {
+export const MACHINE_HASH = (() => {  try {
     const raw = `${os.hostname?.() ?? ''}|${os.platform?.() ?? ''}|${os.arch?.() ?? ''}|${process.env.COMPUTERNAME ?? ''}|${process.env.USERNAME ?? ''}`
     return createHash('sha256').update(raw).digest('hex').slice(0, 12)
   } catch {
@@ -961,6 +960,20 @@ export function apply(ctx, rawConfig) {
         const now = live()
         const probeRes = await probe(resolveBaseURL(now.baseURL))
         const body = renderStatus(probeRes)
+        // 版本戳 + **代码指纹**：指纹 = 读自身源码算 sha256 前 8 位（懒算一次）。
+        // 用途：回答"宿主现在跑的到底是哪一版代码" —— 改完代码不用猜有没有生效
+        //（实测本插件的宿主模块**会被热更新**：改完 index.js + 再动一次 profile patch 就能生效）。
+        if (codeFingerprint === null) {
+          try {
+            const src = await readFile(fileURLToPath(import.meta.url), 'utf8')
+            codeFingerprint = createHash('sha256').update(src).digest('hex').slice(0, 8)
+          } catch {
+            codeFingerprint = 'unknown'
+          }
+        }
+        const pkgVersion = await readFile(path.join(PLUGIN_DIR, 'package.json'), 'utf8')
+          .then((t) => JSON.parse(t)?.version ?? '未知')
+          .catch(() => '未知')
         const hit = (probeRes.models ?? []).find((m) => m.id === now.model || m.id === `${now.model}:latest`)
         const ctxWindow = now.model ? await modelContextWindow(ctx.get('llm'), now.provider, now.model) : null
         const cal = await readCalibration({
@@ -971,6 +984,7 @@ export function apply(ctx, rawConfig) {
           ollamaVersion: probeRes.version ?? null,
         })
         return [
+          `[版本] v${pkgVersion} ｜ 代码指纹 ${codeFingerprint}（改完代码看这里有没有变 → 判断宿主是否已重新加载）`,
           body,
           renderCalibration(cal, ctxWindow),
           `用法 / 前置条件 / 验收纪律见：${README_PATH}`,

@@ -1,7 +1,7 @@
 ---
 doc: usage-declaration
 plugin: "@local/dsh-local-ollama-models"
-version: 1.11.0
+version: 1.11.3
 audience: AI agent（人类也可直接阅读）
 purpose: 让任何一台刚装上本插件的机器上的 AI，无需历史对话即可正确启用、使用并验收本插件
 host-tools: [ollama_local_models, subagent_local]
