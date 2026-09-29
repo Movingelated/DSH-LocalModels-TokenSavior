@@ -1,7 +1,7 @@
 ---
 doc: usage-declaration
 plugin: "@local/dsh-local-ollama-models"
-version: 1.6.1
+version: 1.7.0
 audience: AI agent（人类也可直接阅读）
 purpose: 让任何一台刚装上本插件的机器上的 AI，无需历史对话即可正确启用、使用并验收本插件
 host-tools: [ollama_local_models, subagent_local]
@@ -194,8 +194,11 @@ cordis_inspect_query client / Slots / listSubTree {root: "settings.section"}
 - 返回：端点 / 连通性 / 版本 / 模型总数 / 可作子代理数 / 可用模型清单（带体积、量化、上下文、人设警告）+ 本 README 路径。
 - 用于：委派前的环境确认；以及"这台机器上到底有什么模型"。
 
-### `subagent_local({ prompt, model?, label?, collect? })`
-- `prompt`（必填）：自包含任务描述。**必须**含要提取什么、期望输出格式。
+### `subagent_local({ task?, prompt?, mode?, model?, label?, collect? })`
+- **`task`（v1.7.0 起推荐）**：只写任务本身（一句话：要什么 + 归类口径）。插件按 `mode` 套上**公式化提示词**
+  （角色 / 铁律 / 输出格式 / HITS·TOTAL 对账），调用方不必再手写格式。见 §5.5。
+- `prompt`（可选，高级用法）：完整提示词原文；**给了它就不再套模板**。任务形状不是"分类/计数表"时用它。
+- **`mode`（可选）**：`a`/`max-save`、`b`/`balanced`（默认）、`c`/`fast`；省略则用「设置 → 本地模型」里的默认。见 §5.5。
 - `model`（可选）：覆盖默认模型，须在 §2.3 的已声明列表内。
 - `label`（可选）：会话里显示的短标签。
 - **`collect`（可选，v1.5.0 起强烈建议；v1.6.0 起支持自动分批）**：让**宿主侧**代取素材，直接把命中行拼进子代理的 prompt。
@@ -293,6 +296,31 @@ prompt 里**不用再写路径**（素材已附在 prompt 末尾），只写"要
 
 **怎么调**：阈值与文案都在 `index.js` —— `BIG_READ_CHARS`（默认 30000 字符）、`DELEGATION_POLICY`。
 ⚠ 政策文本**必须保持静态**（见 §10 第 7 条）。
+
+### 5.5 三种调用模式（v1.7.0：公式化提示词）
+
+调用方**不必再手写格式**：给 `task` + `mode`，插件自动套上角色、铁律、输出格式与对账要求。
+
+| 模式 | 别名 | 素材上限 | 分批阈值 | 输出 | 云端 token | 本地时间 | 召回 |
+|---|---|---|---|---|---|---|---|
+| **a** 极致省 token | `max-save` | 200 000 字符 | >40 行强制分批 | ≤15 行 + 逐类穷尽 | 最少\* | 最长（N+1 次推理） | 最高 |
+| **b** 均衡（默认） | `balanced` | 60 000 | >120 行才分批 | ≤12 行 | 少 | 中 | 中 |
+| **c** 快跑 | `fast` | 15 000 | 从不分批 | ≤8 行，小类并入「其他」 | 省得有限\* | 最短 | 低（需补核） |
+
+\* 云端节省主要由"素材**不进**主上下文"决定，三种模式其实一样；差别在**召回率**：
+a 召回高 → 调用方几乎不用补核；c 召回低 → 多半要回头补核，**实际省得更少**。这就是"a 省最多、c 省得有限"的机制。
+
+```jsonc
+subagent_local({
+  "task": "把素材里的告警按根因归类",          // ← 只写任务，格式由插件套
+  "mode": "a",                                  // ← a/b/c 或 max-save/balanced/fast
+  "collect": { "path": "D:\\logs", "include": "app*.log", "pattern": "WARN|ERROR" }
+})
+```
+
+- 省略 `mode` → 用「设置 → 本地模型」里的默认（面板可直接切换）。
+- 省略 `collect.maxChars` / `collect.chunkLines` → 按模式取默认；显式给值可覆盖（`chunkLines: 0` = 强制不分批）。
+- 模板原文在 `index.js` 的 `MODES` 与 `buildPromptFor()` —— 要改文案只改那一处。
 
 ## 6. 验收纪律（本节最重要）
 

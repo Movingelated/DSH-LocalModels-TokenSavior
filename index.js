@@ -203,6 +203,73 @@ function buildMergePrompt(parts, ran, total) {
 }
 
 /**
+ * 三种调用模式（v1.7.0）—— 把"公式化的提示词"内置进插件，调用方只填任务本身。
+ *
+ * 设计依据（README §9.1 的对照实验）：本地模型的可靠性受**素材规模**影响最大
+ * （33 行 100% / 115 行 59%），而云端省下的 token mainly 由"素材不进主上下文"决定 ——
+ * 所以三个模式的差别主要是**本地时间与召回率**；c 因为可靠性低、调用方多半要补核，
+ * 实际省得反而更少（这就是"省得有限"的机制）。
+ */
+const MODES = {
+  'max-save': {
+    label: 'a 极致省 token（最慢）',
+    maxChars: 200000,
+    chunkLines: 40,
+    maxRows: 15,
+    brief: '按根因归类去重；同一类合并为一行、次数相加、保留一条代表原文与一处出处',
+    extra: [
+      '**逐类穷尽**：素材里出现的每一类都必须列出，哪怕只有 1 条；不得为凑数而合并或省略。',
+      '先机械清点素材总条数，再归类；TOTAL 必须等于清点结果。',
+    ],
+  },
+  balanced: {
+    label: 'b 均衡',
+    maxChars: 60000,
+    chunkLines: 120,
+    maxRows: 12,
+    brief: '按根因归类去重；同一类合并为一行、次数相加、保留一条代表原文与一处出处',
+    extra: [],
+  },
+  fast: {
+    label: 'c 快跑（省得有限）',
+    maxChars: 15000,
+    chunkLines: 0,
+    maxRows: 8,
+    brief: '只列主要类别，小类别（≤2 条）可并入「其他」；不要逐条穷举',
+    extra: ['本模式追求速度，召回率较低：调用方需要自行补核。'],
+  },
+}
+
+/** 把调用方/配置给的模式名归一化：接受 a/b/c 与 max-save/balanced/fast。 */
+function normalizeMode(raw) {
+  const s = String(raw ?? '').trim().toLowerCase()
+  if (!s) return null
+  if (s === 'a' || s === 'max-save' || s === 'maxsave' || s === 'max') return 'max-save'
+  if (s === 'b' || s === 'balanced' || s === 'balance') return 'balanced'
+  if (s === 'c' || s === 'fast' || s === 'quick') return 'fast'
+  return null
+}
+
+/** 按模式把"任务一句话"套成完整提示词（角色 + 铁律 + 输出格式 + 对账）。 */
+export function buildPromptFor(modeKey, task) {
+  const mode = MODES[modeKey] ?? MODES.balanced
+  const rules = [
+    '只基于素材作答：不要自己去读文件或检索（取数工具已被禁用）。',
+    `归类要求：${mode.brief}。`,
+    ...mode.extra,
+    '输出格式（严格照此，不要开场白、不要解释、不要建议、不要结语）：\n' +
+      '分类 | 次数 | 代表原文(最多80字) | 出处(文件名:行号)\n' +
+      `（按次数从多到少排序，最多 ${mode.maxRows} 行）\nTOTAL=<你归类覆盖的素材条数>`,
+  ]
+  return (
+    `你是本地只读采集工人。任务：${String(task ?? '').trim()}\n` +
+    '你看不到任何对话上下文；素材由宿主侧预取，附在本消息末尾（每行带 `文件名:行号  ` 前缀）。\n\n' +
+    rules.map((r, i) => `${i + 1}. ${r}`).join('\n') +
+    '\n'
+  )
+}
+
+/**
  * 写进**系统提示词**的委派政策段落 —— 本插件最重要的一次"行为修正"。
  *
  * 为什么需要它：工具描述只说"我能做什么"，不会在具体情境里主动冒出来。
@@ -285,6 +352,7 @@ export const Config = z
       baseURL: z.string().default('').volatile(),
       toolName: z.string().default('subagent_local'),
       provider: z.string().default('ollama-local'),
+      mode: z.string().default('balanced').volatile(),
     })
   : undefined
 
@@ -478,6 +546,7 @@ export function apply(ctx, rawConfig) {
     baseURL: String(deref(config.baseURL) ?? '').trim(),
     toolName: String(deref(config.toolName) ?? '').trim() || 'subagent_local',
     provider: String(deref(config.provider) ?? '').trim() || 'ollama-local',
+    mode: String(deref(config.mode) ?? '').trim() || 'balanced',
   })
 
   const snap = live()
@@ -530,7 +599,8 @@ export function apply(ctx, rawConfig) {
           prompt: {
             type: 'string',
             description:
-              '自包含的任务描述：要读的文件绝对路径、要提取什么、期望的输出格式。本地模型看不到本对话，必须写全。',
+              '（高级用法，一般不必给）完整的提示词原文；给了它就**不再套用模式模板**。' +
+              '常规做法是 task + mode —— 角色、铁律、输出格式、HITS/TOTAL 对账都由插件套好。',
           },
           model: {
             type: 'string',
@@ -554,13 +624,27 @@ export function apply(ctx, rawConfig) {
               chunkLines: {
                 type: 'number',
                 description:
-                  '素材行数超过该值时**自动分批**：宿主切成每片 ≤N 行，逐片归类后再合并（默认 0 = 不分批）。' +
-                  '实测同一模型 33 行可 100% 覆盖、115 行只剩 59%，所以素材大时建议 40 左右。',
+                  '素材行数超过该值时**自动分批**：宿主切成每片 ≤N 行，逐片归类后再合并（省略则按 mode 的阈值；显式 0 = 不分批）。',
               },
             },
           },
+          task: {
+            type: 'string',
+            description:
+              '**推荐用法**：只写任务本身（一句话：要什么 + 归类口径），插件按 mode 套上公式化提示词' +
+              '（角色 / 铁律 / 输出格式 / HITS·TOTAL 对账）。与 prompt 二选一；同时给时以 prompt 为准。' +
+              '任务形状不是"分类/计数表"时，改用 prompt 自己写格式。',
+          },
+          mode: {
+            type: 'string',
+            description:
+              '调用模式（省略则用「设置 → 本地模型」里的默认）：' +
+              '**a / max-save** = 极致省 token 但最慢（素材上限 200k、>40 行强制分批、逐类穷尽、最多 15 行）；' +
+              '**b / balanced** = 均衡（默认；上限 60k、>120 行才分批、最多 12 行）；' +
+              '**c / fast** = 快跑（上限 15k、从不分批、只列主要类别、最多 8 行；省得有限且需自行补核）。',
+          },
         },
-        required: ['prompt'],
+        required: [],
       },
       output: {
         schema: { type: 'string' },
@@ -572,8 +656,19 @@ export function apply(ctx, rawConfig) {
         if (!now.enabled) {
           throw new Error('本地模型委派当前处于关闭状态。打开「设置 → 本地模型」里的开关即可启用。')
         }
-        const prompt = String(args?.prompt ?? '').trim()
-        if (!prompt) throw new Error('prompt 不能为空')
+        // 模式（v1.7.0）：调用方给的 mode 优先，否则用设置里的默认
+        const modeKey = normalizeMode(args?.mode) ?? normalizeMode(now.mode) ?? 'balanced'
+        const mode = MODES[modeKey]
+        // 公式化提示词：给 task 就由插件套模板；给 prompt 则原样使用（高级用法）
+        const manualPrompt = String(args?.prompt ?? '').trim()
+        const taskText = String(args?.task ?? '').trim()
+        const prompt = manualPrompt || (taskText ? buildPromptFor(modeKey, taskText) : '')
+        if (!prompt) {
+          throw new Error(
+            '要么给 task（推荐：一句话任务，插件按 mode 套公式），要么给完整的 prompt。' +
+              `当前模式：${mode.label}`,
+          )
+        }
         const model = String(args?.model ?? '').trim() || now.model
         if (!model) {
           throw new Error(
@@ -694,21 +789,26 @@ export function apply(ctx, rawConfig) {
           return `${merged}\n\n${[...new Set(notes)].join('\n')}`
         }
 
-        // 素材由宿主代取（v1.5.0）；素材过大时自动分批 + 合并（v1.6.0）
+        // 素材由宿主代取（v1.5.0）；素材过大时自动分批 + 合并（v1.6.0）；阈值按 mode 取默认（v1.7.0）
         let material = ''
         let materialNote = ''
         let extraDeny = []
         if (args?.collect && typeof args.collect === 'object') {
-          const c = await collectMaterial(args.collect)
+          const spec = { ...args.collect }
+          if (spec.maxChars === undefined) spec.maxChars = mode.maxChars
+          const c = await collectMaterial(spec)
           materialNote =
+            `[模式] ${mode.label}（素材上限 ${mode.maxChars} / 分批阈值 ${mode.chunkLines || '关闭'} / 最多 ${mode.maxRows} 行）\n` +
             `[宿主预取素材] ${c.files} 个文件 / ${c.lines} 行 / ${c.chars} 字符${c.truncated ? '（已按上限截断）' : ''}` +
             (c.notes.length ? `；${c.notes.join('；')}` : '')
           extraDeny = ['grep', 'glob']
           const rows = c.text ? c.text.split('\n') : []
           const chunkLines =
-            Number.isFinite(args.collect.chunkLines) && args.collect.chunkLines > 0
-              ? Math.min(Math.floor(args.collect.chunkLines), 500)
-              : 0
+            args.collect.chunkLines === undefined
+              ? mode.chunkLines
+              : Number.isFinite(args.collect.chunkLines) && args.collect.chunkLines > 0
+                ? Math.min(Math.floor(args.collect.chunkLines), 500)
+                : 0
           if (chunkLines > 0 && rows.length > chunkLines) {
             return await runChunked(rows, chunkLines)
           }

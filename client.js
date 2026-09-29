@@ -341,6 +341,39 @@ window.__ModuleLoader__.load({
         ),
       ));
 
+      // ── 调用模式（v1.7.0）──
+      const MODE_ROWS = [
+        { key: 'max-save', name: 'a 极致省 token', hint: '最慢：素材上限 200k、>40 行强制分批、逐类穷尽 → 召回最高，我几乎不用补核' },
+        { key: 'balanced', name: 'b 均衡（默认）', hint: '上限 60k、>120 行才分批、最多 12 行' },
+        { key: 'fast', name: 'c 快跑', hint: '最快：上限 15k、从不分批、只列主要类别 —— 召回较低，需要我补核' },
+      ];
+      const curMode = String(cfg?.mode ?? 'balanced');
+      out.push(h('div', { key: 'mode', style: S.card },
+        h('div', { style: S.title }, '调用模式（默认提示词模板）'),
+        h('div', { style: S.hint },
+          '调用方可以按次指定 a/b/c 覆盖；这里设的是**没指定时**的默认。三种模式的差别主要是本地时间与召回率 —— ' +
+          '云端省下的 token 都差不多（素材都不进主上下文），但 a 召回高、c 需要我回头补核。'),
+        h('div', { style: S.list },
+          MODE_ROWS.map((m) => h('label', {
+            key: m.key,
+            style: { ...S.item, ...(curMode === m.key ? S.sel : {}), cursor: writable ? 'pointer' : 'default' },
+          },
+            h('input', {
+              type: 'radio',
+              name: 'local-ollama-mode',
+              checked: curMode === m.key,
+              disabled: busy || !writable,
+              onChange: () => write('mode', m.key),
+              style: { marginTop: 3 },
+            }),
+            h('div', { style: { flex: 1, minWidth: 0 } },
+              h('div', { style: { fontWeight: curMode === m.key ? 600 : 400 } }, m.name),
+              h('div', { style: S.meta }, m.hint),
+            ),
+          )),
+        ),
+      ));
+
       // ── 可写性说明 ──
       if (nsFound === false) {
         out.push(h('div', { key: 'nosw', style: S.alert },
@@ -452,7 +485,7 @@ window.__ModuleLoader__.load({
       if (err) out.push(h('div', { key: 'err', style: S.alert }, err));
 
       out.push(h('div', { key: 'foot', style: S.hint },
-        '说明：本栏目由插件 local-ollama-models v1.6.1 提供。完整说明书（用法 / 前置条件 / 验收纪律 / 排错）' +
+        '说明：本栏目由插件 local-ollama-models v1.7.0 提供。完整说明书（用法 / 前置条件 / 验收纪律 / 排错）' +
         '在插件目录的 README.md；在「插件」页停用该 bundle 也能关闭全部功能。'));
 
       return h('div', { style: S.wrap }, out);
