@@ -20,6 +20,7 @@
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { readFile, readdir, stat } from 'node:fs/promises'
 
 /**
  * 本插件目录与说明书路径。
@@ -68,8 +69,8 @@ const READONLY_DENY = [
  * 一次剔除一批，才能保住其余防护。
  * 为什么不能静默：真机实测过一次静默降级 —— 子代理照样拿到 32 个工具，而调用方毫不知情。
  */
-async function startChild(subagents, ctx, spec) {
-  let deny = [...READONLY_DENY]
+async function startChild(subagents, ctx, spec, extraDeny = []) {
+  let deny = [...READONLY_DENY, ...extraDeny]
   const dropped = []
   for (;;) {
     if (deny.length === 0) {
@@ -101,6 +102,87 @@ function readonlyNote(dropped, all) {
   return all
     ? '⚠ 只读过滤未生效：本部署拒绝了整份 deny 名单，子代理拿到的是全部工具，只读性仅由任务约束保证。'
     : `⚠ 只读过滤未完全生效：${dropped.join(', ')} 在本部署不可 restrict、已从名单剔除，子代理仍可使用这几个工具。`
+}
+
+/** 把一个只含 `*` / `?` 的文件名 glob 编译成正则（零依赖）。 */
+function globToRegExp(glob) {
+  const escaped = String(glob).replace(/[.+^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`^${escaped.replace(/\*/g, '[^/\\\\]*').replace(/\?/g, '.')}$`)
+}
+
+/**
+ * 宿主侧预取素材（v1.5.0）—— 本插件最重要的一次"防呆"。
+ *
+ * 为什么必须由宿主来取：弱模型自己调 grep 时会**静默篡改 pattern**。实测铁证：
+ * 我们给它 `\[(WARN|ERROR)`，它自作主张补成 `\[(WARN|ERROR)\]`；而日志里的告警标记是
+ * `[WARN ]`（WARN 后面有空格），于是 **22/34 行被无声滤掉** —— 它对着剩下的 12 行认真归类，
+ * 还自信地报 TOTAL=12：行号真、原文真、格式规整，**唯一的破绽是最大的一整类凭空消失**。
+ * 换成由宿主取素材：素材 100% 正确、不经过主上下文、也不依赖弱模型的工具调用参数。
+ *
+ * @returns 命中行文本（每行带 `文件名:行号  ` 前缀）与计数，供调用方核对。
+ */
+export async function collectMaterial(spec) {
+  const out = { text: '', files: 0, lines: 0, chars: 0, scanned: 0, truncated: false, notes: [] }
+  const root = String(spec?.path ?? '').trim()
+  if (!root) throw new Error('collect.path 不能为空：给文件的绝对路径，或给目录并配 include')
+  const maxChars = Number.isFinite(spec?.maxChars) && spec.maxChars > 0 ? Math.min(spec.maxChars, 400000) : 60000
+
+  let pattern = null
+  const rawPattern = String(spec?.pattern ?? '').trim()
+  if (rawPattern) {
+    try {
+      pattern = new RegExp(rawPattern)
+    } catch (e) {
+      throw new Error(`collect.pattern 不是合法正则：${String(e?.message ?? e)}`)
+    }
+  }
+
+  const st = await stat(root).catch(() => null)
+  if (!st) throw new Error(`collect.path 不存在：${root}`)
+  let files = []
+  if (st.isDirectory()) {
+    const include = String(spec?.include ?? '*').trim() || '*'
+    const re = globToRegExp(include)
+    const entries = await readdir(root, { withFileTypes: true })
+    files = entries
+      .filter((e) => e.isFile() && re.test(e.name))
+      .map((e) => path.join(root, e.name))
+      .sort()
+    if (files.length === 0) throw new Error(`collect.include="${include}" 在 ${root} 下没有匹配到任何文件`)
+  } else {
+    files = [root]
+  }
+
+  const parts = []
+  for (const f of files) {
+    let text = ''
+    try {
+      text = await readFile(f, 'utf8')
+    } catch (e) {
+      out.notes.push(`读取失败 ${path.basename(f)}：${String(e?.message ?? e)}`)
+      continue
+    }
+    out.files++
+    const lines = text.split(/\r?\n/)
+    out.scanned += lines.length
+    const base = path.basename(f)
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (!line.trim()) continue
+      if (pattern && !pattern.test(line)) continue
+      const row = `${base}:${i + 1}  ${line}`
+      if (out.chars + row.length + 1 > maxChars) {
+        out.truncated = true
+        break
+      }
+      parts.push(row)
+      out.chars += row.length + 1
+      out.lines++
+    }
+    if (out.truncated) break
+  }
+  out.text = parts.join('\n')
+  return out
 }
 
 /**
@@ -438,6 +520,22 @@ export function apply(ctx, rawConfig) {
             description: '可选：改用其他本地模型执行。可先用 ollama_local_models 查看候选。',
           },
           label: { type: 'string', description: '可选短标签，用于在会话里显示这次委派。' },
+          collect: {
+            type: 'object',
+            description:
+              '**强烈建议**：让宿主侧代为预取素材（读文件 + 正则过滤），直接拼进子代理的 prompt。' +
+              '用它可避免弱模型自己调 grep 时**静默篡改正则**、导致素材整类缺失（实测 22/34 行被无声滤掉）。' +
+              '给了它，子代理的 grep/glob 会被自动禁用，素材不进主上下文。',
+            properties: {
+              path: { type: 'string', description: '文件的绝对路径，或一个目录（配 include）' },
+              include: { type: 'string', description: 'path 是目录时用的文件名 glob，如 "launcher*.log"；默认 *' },
+              pattern: {
+                type: 'string',
+                description: '只保留匹配该正则的行（JS 正则；建议用最简形式，如 WARN|ERROR）；省略则取全部非空行',
+              },
+              maxChars: { type: 'number', description: '素材字符上限，默认 60000；超出则截断并在结果里标注' },
+            },
+          },
         },
         required: ['prompt'],
       },
@@ -479,13 +577,37 @@ export function apply(ctx, rawConfig) {
           )
         }
 
-        const started = await startChild(subagents, ctx, {
-          label: typeof args?.label === 'string' && args.label ? args.label : '本地模型',
-          prompt: [{ type: 'text', text: prompt }],
-          parent: exec.agent,
-          signal: exec.signal,
-          agentOptions: { provider: now.provider, model },
-        })
+        // 素材由宿主代取（v1.5.0）：弱模型自己 grep 会静默篡改 pattern，导致素材缺一整类
+        let material = ''
+        let materialNote = ''
+        let extraDeny = []
+        if (args?.collect && typeof args.collect === 'object') {
+          const c = await collectMaterial(args.collect)
+          material =
+            `\n\n=== 素材（宿主侧已预取：${c.files} 个文件 / 命中 ${c.lines} 行 / ${c.chars} 字符` +
+            `${c.truncated ? '，⚠ 已按上限截断' : ''}；共扫描 ${c.scanned} 行）===\n` +
+            c.text +
+            '\n=== 素材结束 ===\n' +
+            '以上**就是本任务的全部素材**，请只基于它作答；不要自己去读文件或检索（取数工具已禁用）。'
+          materialNote =
+            `[宿主预取素材] ${c.files} 个文件 / ${c.lines} 行 / ${c.chars} 字符${c.truncated ? '（已截断）' : ''}` +
+            (c.notes.length ? `；${c.notes.join('；')}` : '')
+          extraDeny = ['grep', 'glob']
+        }
+        const childPrompt = material ? `${prompt}${material}` : prompt
+
+        const started = await startChild(
+          subagents,
+          ctx,
+          {
+            label: typeof args?.label === 'string' && args.label ? args.label : '本地模型',
+            prompt: [{ type: 'text', text: childPrompt }],
+            parent: exec.agent,
+            signal: exec.signal,
+            agentOptions: { provider: now.provider, model },
+          },
+          extraDeny,
+        )
         const run = started.run
         // 只读保证的三层（从强到弱）：
         //  ① toolFilter deny 掉写/执行/再派活类工具（见 READONLY_DENY；不可用的名字逐个剔除并如实告知）
@@ -494,7 +616,8 @@ export function apply(ctx, rawConfig) {
         // 刻意不用 maxDepth: 0 —— 那表示"禁止任何委派"，会把子代理卡在启动前（实测踩过）。
         try {
           const body = resultText(await run.result)
-          return started.note ? `${body}\n\n${started.note}` : body
+          const notes = [materialNote, started.note].filter(Boolean).join('\n')
+          return notes ? `${body}\n\n${notes}` : body
         } finally {
           try {
             await run.dispose?.()
