@@ -959,17 +959,16 @@ export function apply(ctx, rawConfig) {
       },
       execute: async () => {
         const now = live()
-        const body = renderStatus(await probe(resolveBaseURL(now.baseURL)))
-        const hit = (await probe(resolveBaseURL(now.baseURL)).catch(() => null))?.models?.find(
-          (m) => m.id === now.model || m.id === `${now.model}:latest`,
-        )
+        const probeRes = await probe(resolveBaseURL(now.baseURL))
+        const body = renderStatus(probeRes)
+        const hit = (probeRes.models ?? []).find((m) => m.id === now.model || m.id === `${now.model}:latest`)
         const ctxWindow = now.model ? await modelContextWindow(ctx.get('llm'), now.provider, now.model) : null
         const cal = await readCalibration({
           provider: now.provider,
           model: now.model,
           contextWindow: ctxWindow,
           modelDigest: hit?.digest ?? null,
-          ollamaVersion: null,
+          ollamaVersion: probeRes.version ?? null,
         })
         return [
           body,
