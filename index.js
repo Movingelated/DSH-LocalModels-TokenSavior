@@ -186,21 +186,23 @@ export async function collectMaterial(spec) {
 }
 
 /**
- * 构建"合并各分片结论"的 prompt（v1.6.0 分批模式用）。
+ * 构建"合并各分片结论"的 prompt（v1.6.0 起；v1.8.0 起按任务类型分化）。
  * 分片结论都很小，所以合并这一步几乎不吃上下文。
  */
-function buildMergePrompt(parts, ran, total) {
+function buildMergePrompt(kindKey, parts, ran, total) {
+  const kind = KINDS[kindKey] ?? KINDS.classify
   const body = parts.map((p, i) => `--- 分片 ${i + 1} ---\n${p.text}`).join('\n')
   return (
-    `你是本地只读采集工人。下面是同一批素材被切成 ${total} 片后、各自归类的结果` +
+    `你是本地只读采集工人。下面是同一批素材被切成 ${total} 片后、各自的处理结果` +
     `${total > ran ? `（本次只跑了前 ${ran} 片）` : ''}。\n` +
-    '请把它们**合并去重成一张最终表**：同一根因合并为一行、次数相加、保留一个代表原文与出处；不要新增分片里没有的类别；' +
-    '**次数只汇总各片报出的数字，不要重新估算、也不要重复计数**。\n' +
-    '输出格式（严格照此，不要开场白、不要解释、不要建议）：\n' +
-    '分类 | 次数 | 代表原文(最多80字) | 出处(文件名:行号)\n（按次数从多到少排序）\nTOTAL=<次数合计>\n\n' +
+    kind.merge +
+    '\n\n' +
     body
   )
 }
+
+/** 单次上下文预算（字符）。禁止分片的类型超过它就必须报错，而不是悄悄截断。 */
+const CONTEXT_BUDGET = 60000
 
 /**
  * 三种调用模式（v1.7.0）—— 把"公式化的提示词"内置进插件，调用方只填任务本身。
@@ -250,23 +252,147 @@ function normalizeMode(raw) {
   return null
 }
 
-/** 按模式把"任务一句话"套成完整提示词（角色 + 铁律 + 输出格式 + 对账）。 */
-export function buildPromptFor(modeKey, task) {
+/**
+ * 任务类型（v1.8.0）—— 每种类型自带三件套：**素材策略 + 输出契约 + 验收动作**。
+ *
+ * 为什么要它（README §9.2 的问答实验）：三个模式只调"喂多少"，但不同任务对素材的
+ * **使用方式**根本不同 —— 问答一旦分片，就等于让它在残缺材料里找答案（实测）；
+ * 代码勘查则相反：必须让它自己 read/grep 去探索。输出契约更是各不相同
+ * （分类要表格、问答要"答案+行号"、抽取要 JSON、摘要要实体）。把它们做成可插拔的类型，
+ * 插件才谈得上泛用；而**每种类型都带一条验收动作**，是"没有尺子就不许加类型"的纪律。
+ */
+const KINDS = {
+  classify: {
+    label: 'classify 分类 / 计数（默认）',
+    noChunk: false,
+    minChars: 0,
+    allowFetch: false,
+    rules: (m) => [
+      '只基于素材作答：不要自己去读文件或检索（取数工具已被禁用）。',
+      `归类要求：${m.brief}。`,
+      ...m.extra,
+      '输出格式（严格照此，不要开场白、不要解释、不要建议、不要结语）：\n' +
+        '分类 | 次数 | 代表原文(最多80字) | 出处(文件名:行号)\n' +
+        `（按次数从多到少排序，最多 ${m.maxRows} 行）\nTOTAL=<你归类覆盖的素材条数>`,
+    ],
+    merge:
+      '请把它们**合并去重成一张最终表**：同一根因合并为一行、次数相加、保留一个代表原文与出处；不要新增分片里没有的类别；' +
+      '**次数只汇总各片报出的数字，不要重新估算、也不要重复计数**。\n' +
+      '输出格式（严格照此，不要开场白、不要解释、不要建议）：\n' +
+      '分类 | 次数 | 代表原文(最多80字) | 出处(文件名:行号)\n（按次数从多到少排序）\nTOTAL=<次数合计>',
+    chunkHint: '请只归类这一片，不要推测其它片的内容。',
+    verify: '先 grep 复核总数与各类计数，再抽查 2~3 条出处行号 —— **计数一向不可信**（README §6）',
+  },
+  qa: {
+    label: 'qa 大文档问答（不分片）',
+    noChunk: true,
+    minChars: 100000,
+    allowFetch: false,
+    rules: () => [
+      '只基于素材作答：不要自己去读文件或检索（取数工具已被禁用）。',
+      '**逐题作答，不得跳题**：答不出的题也必须写出题号，并明确写「素材里没有」—— 不要猜测、不要编造、不要用常识补全。',
+      '每题都必须给出处行号（形如 `文件:行号`）；直接引用原文时保留原文，其余用自己的话概括。',
+      '**用与任务描述相同的语言作答**（直接引用的原文除外）。',
+      '输出格式（严格照此，不要开场白、不要解释、不要建议）：\n' +
+        'Q<编号> | 答案 | 出处(文件:行号)\n最后单独一行 ANSWERED=<你回答的题数>/<总题数>',
+    ],
+    merge: '（qa 类型禁止分片，不会走到合并这一步）',
+    chunkHint: '',
+    verify:
+      '抽查 2~3 个行号是否指向真实内容；ANSWERED 的分母必须等于题数 —— **不足就是漏答**，' +
+      '而"答薄"比"答错"更难发现（README §9.2）',
+  },
+  extract: {
+    label: 'extract 结构化抽取（JSON）',
+    noChunk: false,
+    minChars: 0,
+    allowFetch: false,
+    rules: () => [
+      '只基于素材作答：不要自己去读文件或检索（取数工具已被禁用）。',
+      '按任务里给出的**字段清单**逐条抽取，组成对象数组；**抽不到的字段写 null**，不要编造。',
+      '每个对象必须带 `_src` 字段，值为出处（`文件:行号`）。',
+      '**输出严格 JSON**（一个数组；不要 markdown 代码块、不要解释、不要前后缀）。',
+      '输出格式：\n[{"<字段1>": ..., "<字段2>": ..., "_src": "文件:行号"}]\n最后单独一行 COUNT=<你抽出的对象数>',
+    ],
+    merge:
+      '请把它们**合并成一个 JSON 数组**：直接拼接各片的数组元素、保持字段一致、不要新增或改写字段、不要把同一对象算两遍。\n' +
+      '输出格式（严格照此）：\n[ {...}, {...} ]\n最后单独一行 COUNT=<数组元素总数>',
+    chunkHint: '只抽取这一片里出现的对象，不要推测其它片的内容。',
+    verify: '先 JSON.parse（解析失败就是废结果）；抽查 2~3 条 `_src` 行号；COUNT 必须等于数组长度',
+  },
+  summary: {
+    label: 'summary 摘要 / 提炼',
+    noChunk: false,
+    minChars: 0,
+    allowFetch: false,
+    rules: () => [
+      '只基于素材作答：不要自己去读文件或检索（取数工具已被禁用）。',
+      '提炼要点，**保留关键实体**（文件名、版本号、数字、配置项、结论）—— 不要写"文档介绍了……"这类空话。',
+      '按重要性排序，每条不超过两行，每条都要带出处行号。',
+      '输出格式（严格照此，不要开场白、不要解释、不要建议）：\n- <要点> | 出处(文件:行号)\nKEY=<关键实体/数字，用「、」分隔>\nPOINTS=<要点条数>',
+    ],
+    merge:
+      '请把它们**合并去重成一份要点清单**：同义要点合并、按重要性排序、每条保留最具体的那一版（带数字/结论的）。\n' +
+      '输出格式（严格照此）：\n- <要点> | 出处(文件:行号)\nKEY=<关键实体/数字>\nPOINTS=<要点条数>',
+    chunkHint: '只提炼这一片的要点，不要总结其它片。',
+    verify: '抽 2~3 条要点回查行号；KEY 里的数字/实体要在素材里 grep 得到 —— 摘要最容易"顺手编数字"',
+  },
+  code: {
+    label: 'code 代码只读勘查（允许它自己检索）',
+    noChunk: true,
+    minChars: 0,
+    allowFetch: true,
+    rules: () => [
+      '你是**只读**代码勘查员：可以用 `read` / `grep` / `glob` 在任务指定的目录里自己检索（写文件、执行命令类工具已被禁用）。',
+      '逐条列出任务要求的项目，每条给出 `文件:行号`；**只报你实际看到的内容**，不要推测、不要补全。',
+      '不要提改进建议、不要评价代码质量、不要贴大段源码（除非任务明确要求）。',
+      '输出格式（严格照此，不要开场白、不要解释、不要建议）：\n项目 | 说明(最多80字) | 出处(文件:行号)\n最后单独一行 ITEMS=<条数>',
+    ],
+    merge: '（code 类型禁止分片，不会走到合并这一步）',
+    chunkHint: '',
+    verify: '逐条用 grep 回查；ITEMS 必须等于行数 —— 这类清单最容易**漏项**，而漏了比错了更难发现',
+  },
+}
+
+const KIND_ALIASES = {
+  分类: 'classify',
+  计数: 'classify',
+  count: 'classify',
+  counting: 'classify',
+  问答: 'qa',
+  question: 'qa',
+  'q&a': 'qa',
+  抽取: 'extract',
+  extraction: 'extract',
+  json: 'extract',
+  摘要: 'summary',
+  summarize: 'summary',
+  提炼: 'summary',
+  代码: 'code',
+  codereview: 'code',
+  'code-review': 'code',
+}
+
+/** 把调用方给的任务类型归一化；不认识就返回 null（由调用方决定报错还是回退）。 */
+function normalizeKind(raw) {
+  const s = String(raw ?? '').trim().toLowerCase()
+  if (!s) return null
+  if (KINDS[s]) return s
+  return KIND_ALIASES[s] ?? null
+}
+
+/** 按 (任务类型, 模式) 把"任务一句话"套成完整提示词：角色 + 铁律 + 输出契约。 */
+export function buildPromptFor(kindKey, modeKey, task, opts = {}) {
+  const kind = KINDS[kindKey] ?? KINDS.classify
   const mode = MODES[modeKey] ?? MODES.balanced
-  const rules = [
-    '只基于素材作答：不要自己去读文件或检索（取数工具已被禁用）。',
-    `归类要求：${mode.brief}。`,
-    ...mode.extra,
-    '输出格式（严格照此，不要开场白、不要解释、不要建议、不要结语）：\n' +
-      '分类 | 次数 | 代表原文(最多80字) | 出处(文件名:行号)\n' +
-      `（按次数从多到少排序，最多 ${mode.maxRows} 行）\nTOTAL=<你归类覆盖的素材条数>`,
-  ]
-  return (
-    `你是本地只读采集工人。任务：${String(task ?? '').trim()}\n` +
-    '你看不到任何对话上下文；素材由宿主侧预取，附在本消息末尾（每行带 `文件名:行号  ` 前缀）。\n\n' +
-    rules.map((r, i) => `${i + 1}. ${r}`).join('\n') +
-    '\n'
-  )
+  const withMaterial = opts.withMaterial !== false
+  const head =
+    `你是本地只读采集工人（任务类型：${kind.label}）。任务：${String(task ?? '').trim()}\n` +
+    '你看不到任何对话上下文。' +
+    (withMaterial
+      ? '素材由宿主侧预取，附在本消息末尾（每行带 `文件名:行号  ` 前缀）。\n\n'
+      : '没有预置素材 —— 按下面的规则自己去检索，只回结论。\n\n')
+  return head + kind.rules(mode).map((r, i) => `${i + 1}. ${r}`).join('\n') + '\n'
 }
 
 /**
@@ -631,9 +757,18 @@ export function apply(ctx, rawConfig) {
           task: {
             type: 'string',
             description:
-              '**推荐用法**：只写任务本身（一句话：要什么 + 归类口径），插件按 mode 套上公式化提示词' +
-              '（角色 / 铁律 / 输出格式 / HITS·TOTAL 对账）。与 prompt 二选一；同时给时以 prompt 为准。' +
-              '任务形状不是"分类/计数表"时，改用 prompt 自己写格式。',
+              '**推荐用法**：只写任务本身（一句话：要什么 + 对象 + 字段/口径），插件按 kind + mode 套上公式化提示词' +
+              '（角色 / 铁律 / 素材策略 / 输出契约 / 验收提示）。与 prompt 二选一；同时给时以 prompt 为准。',
+          },
+          kind: {
+            type: 'string',
+            description:
+              '**任务类型**（省略 = classify）。每种类型自带素材策略 + 输出契约 + 验收动作：' +
+              '**classify** 分类/计数（表格 + TOTAL）；' +
+              '**qa** 大文档问答（逐题 + 必给出处行号 + 「不知道就说没有」，**禁止分片**，素材超 60k 字符会报错）；' +
+              '**extract** 结构化抽取（严格 JSON 数组 + 每个对象带 `_src` 出处）；' +
+              '**summary** 摘要/提炼（要点 + 出处 + KEY 实体）；' +
+              '**code** 代码只读勘查（**允许它自己 read/grep 探索**，逐条给 `文件:行号`）。',
           },
           mode: {
             type: 'string',
@@ -659,16 +794,31 @@ export function apply(ctx, rawConfig) {
         // 模式（v1.7.0）：调用方给的 mode 优先，否则用设置里的默认
         const modeKey = normalizeMode(args?.mode) ?? normalizeMode(now.mode) ?? 'balanced'
         const mode = MODES[modeKey]
+        // 任务类型（v1.8.0）：不认识的名字直接报错，不悄悄回退成 classify
+        const kindRaw = String(args?.kind ?? '').trim()
+        if (kindRaw && !normalizeKind(kindRaw)) {
+          throw new Error(
+            `不认识的任务类型 "${kindRaw}"。可用：${Object.keys(KINDS).join(' / ')}` +
+              '（也接受中文别名：分类 / 问答 / 抽取 / 摘要 / 代码）',
+          )
+        }
+        const kindKey = normalizeKind(kindRaw) ?? 'classify'
+        const kind = KINDS[kindKey]
         // 公式化提示词：给 task 就由插件套模板；给 prompt 则原样使用（高级用法）
         const manualPrompt = String(args?.prompt ?? '').trim()
         const taskText = String(args?.task ?? '').trim()
-        const prompt = manualPrompt || (taskText ? buildPromptFor(modeKey, taskText) : '')
+        const prompt =
+          manualPrompt ||
+          (taskText
+            ? buildPromptFor(kindKey, modeKey, taskText, { withMaterial: Boolean(args?.collect) })
+            : '')
         if (!prompt) {
           throw new Error(
-            '要么给 task（推荐：一句话任务，插件按 mode 套公式），要么给完整的 prompt。' +
-              `当前模式：${mode.label}`,
+            `要么给 task（推荐：一句话任务，插件按 kind + mode 套公式），要么给完整的 prompt。` +
+              `当前：${kind.label} / ${mode.label}`,
           )
         }
+        const verifyNote = `[验收建议] ${kind.verify}`
         const model = String(args?.model ?? '').trim() || now.model
         if (!model) {
           throw new Error(
@@ -748,7 +898,9 @@ export function apply(ctx, rawConfig) {
           for (let i = 0; i < used.length; i++) {
             const head =
               `\n\n=== 素材第 ${i + 1}/${used.length} 片（本片 ${used[i].length} 行；整批 ${rows.length} 行 / 共 ${chunks.length} 片）===\n`
-            const tail = '\n=== 本片素材结束 ===\n以上是**本片**的全部素材；请只归类这一片，不要推测其它片的内容。'
+            const tail =
+              '\n=== 本片素材结束 ===\n以上是**本片**的全部素材；' +
+              (kind.chunkHint || '请只处理这一片，不要推测其它片的内容。')
             try {
               const out = await runOnce(`${prompt}${head}${used[i].join('\n')}${tail}`, `${baseLabel}-片${i + 1}`, extraDeny)
               partials.push({ ok: true, text: out.text, note: out.note })
@@ -767,7 +919,11 @@ export function apply(ctx, rawConfig) {
             mergeNote = '（只有一片成功，未做合并）'
           } else {
             try {
-              const out = await runOnce(buildMergePrompt(okParts, used.length, chunks.length), `${baseLabel}-合并`, extraDeny)
+              const out = await runOnce(
+                buildMergePrompt(kindKey, okParts, used.length, chunks.length),
+                `${baseLabel}-合并`,
+                extraDeny,
+              )
               merged = out.text
               mergeNote = out.note
             } catch (e) {
@@ -785,26 +941,41 @@ export function apply(ctx, rawConfig) {
               `${failed ? `；⚠ ${failed} 片失败` : ''}`,
             mergeNote,
             ...partials.map((p) => p.note).filter(Boolean),
+            verifyNote,
           ].filter(Boolean)
           return `${merged}\n\n${[...new Set(notes)].join('\n')}`
         }
 
-        // 素材由宿主代取（v1.5.0）；素材过大时自动分批 + 合并（v1.6.0）；阈值按 mode 取默认（v1.7.0）
+        // 素材由宿主代取（v1.5.0）；过大自动分批 + 合并（v1.6.0）；阈值按 mode 取默认（v1.7.0）；类型优先（v1.8.0）
         let material = ''
         let materialNote = ''
         let extraDeny = []
         if (args?.collect && typeof args.collect === 'object') {
           const spec = { ...args.collect }
-          if (spec.maxChars === undefined) spec.maxChars = mode.maxChars
+          const maxChars = Math.max(mode.maxChars, kind.minChars)
+          if (spec.maxChars === undefined) spec.maxChars = maxChars
           const c = await collectMaterial(spec)
+          // 禁止分片的类型（qa / code）：素材超单次预算就报错，绝不悄悄截断或分片
+          if (kind.noChunk && c.text.length > CONTEXT_BUDGET) {
+            throw new Error(
+              `${kind.label} 禁止分片：本次素材 ${c.text.length} 字符，超过单次上下文预算 ${CONTEXT_BUDGET} 字符。` +
+                '强行分片就等于让它在残缺材料里找答案（实测过的失败模式）。请二选一：' +
+                '① 用 collect.pattern / include 把素材缩到与问题相关的范围；' +
+                '② 改用 kind=classify 或 summary（这两种支持分片）。',
+            )
+          }
           materialNote =
-            `[模式] ${mode.label}（素材上限 ${mode.maxChars} / 分批阈值 ${mode.chunkLines || '关闭'} / 最多 ${mode.maxRows} 行）\n` +
+            `[任务类型] ${kind.label}\n` +
+            `[模式] ${mode.label}（素材上限 ${maxChars} / 分批阈值 ${
+              kind.noChunk ? '禁用（类型要求）' : mode.chunkLines || '关闭'
+            }）\n` +
             `[宿主预取素材] ${c.files} 个文件 / ${c.lines} 行 / ${c.chars} 字符${c.truncated ? '（已按上限截断）' : ''}` +
             (c.notes.length ? `；${c.notes.join('；')}` : '')
-          extraDeny = ['grep', 'glob']
+          extraDeny = kind.allowFetch ? [] : ['grep', 'glob']
           const rows = c.text ? c.text.split('\n') : []
-          const chunkLines =
-            args.collect.chunkLines === undefined
+          const chunkLines = kind.noChunk
+            ? 0
+            : args.collect.chunkLines === undefined
               ? mode.chunkLines
               : Number.isFinite(args.collect.chunkLines) && args.collect.chunkLines > 0
                 ? Math.min(Math.floor(args.collect.chunkLines), 500)
@@ -817,7 +988,9 @@ export function apply(ctx, rawConfig) {
             `${c.truncated ? '，⚠ 已按上限截断' : ''}；共扫描 ${c.scanned} 行）===\n` +
             c.text +
             '\n=== 素材结束 ===\n' +
-            '以上**就是本任务的全部素材**，请只基于它作答；不要自己去读文件或检索（取数工具已禁用）。'
+            (kind.allowFetch
+              ? '以上是宿主预取的素材；如不够用，你可以用 read / grep 自己去取（这几个工具没有被禁用）。'
+              : '以上**就是本任务的全部素材**，请只基于它作答；不要自己去读文件或检索（取数工具已禁用）。')
         }
         const childPrompt = material ? `${prompt}${material}` : prompt
 
@@ -827,7 +1000,7 @@ export function apply(ctx, rawConfig) {
         //  ③ 子代理看不到本对话，独立上下文
         // 刻意不用 maxDepth: 0 —— 那表示"禁止任何委派"，会把子代理卡在启动前（实测踩过）。
         const out = await runOnce(childPrompt, baseLabel, extraDeny)
-        const notes = [materialNote, out.note].filter(Boolean).join('\n')
+        const notes = [materialNote, out.note, verifyNote].filter(Boolean).join('\n')
         return notes ? `${out.text}\n\n${notes}` : out.text
       },
     }),

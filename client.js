@@ -485,7 +485,7 @@ window.__ModuleLoader__.load({
       if (err) out.push(h('div', { key: 'err', style: S.alert }, err));
 
       out.push(h('div', { key: 'foot', style: S.hint },
-        '说明：本栏目由插件 local-ollama-models v1.7.0 提供。完整说明书（用法 / 前置条件 / 验收纪律 / 排错）' +
+        '说明：本栏目由插件 local-ollama-models v1.8.0 提供。完整说明书（用法 / 前置条件 / 验收纪律 / 排错）' +
         '在插件目录的 README.md；在「插件」页停用该 bundle 也能关闭全部功能。'));
 
       return h('div', { style: S.wrap }, out);

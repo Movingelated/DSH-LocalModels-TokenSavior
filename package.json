@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-local-ollama-models",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "private": true,
   "type": "module",
   "description": "在设置里提供独立的「本地模型」栏目：面板可直接开关与选择模型（volatile Config），并把只读采集任务委派给本地 Ollama 模型执行。用法/前置/验收纪律见 README.md。",
