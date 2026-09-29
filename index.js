@@ -186,6 +186,22 @@ export async function collectMaterial(spec) {
 }
 
 /**
+ * 构建"合并各分片结论"的 prompt（v1.6.0 分批模式用）。
+ * 分片结论都很小，所以合并这一步几乎不吃上下文。
+ */
+function buildMergePrompt(parts, ran, total) {
+  const body = parts.map((p, i) => `--- 分片 ${i + 1} ---\n${p.text}`).join('\n')
+  return (
+    `你是本地只读采集工人。下面是同一批素材被切成 ${total} 片后、各自归类的结果` +
+    `${total > ran ? `（本次只跑了前 ${ran} 片）` : ''}。\n` +
+    '请把它们**合并去重成一张最终表**：同一根因合并为一行、次数相加、保留一个代表原文与出处；不要新增分片里没有的类别。\n' +
+    '输出格式（严格照此，不要开场白、不要解释、不要建议）：\n' +
+    '分类 | 次数 | 代表原文(最多80字) | 出处(文件名:行号)\n（按次数从多到少排序）\nTOTAL=<次数合计>\n\n' +
+    body
+  )
+}
+
+/**
  * 写进**系统提示词**的委派政策段落 —— 本插件最重要的一次"行为修正"。
  *
  * 为什么需要它：工具描述只说"我能做什么"，不会在具体情境里主动冒出来。
@@ -534,6 +550,12 @@ export function apply(ctx, rawConfig) {
                 description: '只保留匹配该正则的行（JS 正则；建议用最简形式，如 WARN|ERROR）；省略则取全部非空行',
               },
               maxChars: { type: 'number', description: '素材字符上限，默认 60000；超出则截断并在结果里标注' },
+              chunkLines: {
+                type: 'number',
+                description:
+                  '素材行数超过该值时**自动分批**：宿主切成每片 ≤N 行，逐片归类后再合并（默认 0 = 不分批）。' +
+                  '实测同一模型 33 行可 100% 覆盖、115 行只剩 59%，所以素材大时建议 40 左右。',
+              },
             },
           },
         },
@@ -577,54 +599,135 @@ export function apply(ctx, rawConfig) {
           )
         }
 
-        // 素材由宿主代取（v1.5.0）：弱模型自己 grep 会静默篡改 pattern，导致素材缺一整类
+        // 起一次子代理并取回文本结论（分批模式会复用多次）
+        const baseLabel = typeof args?.label === 'string' && args.label ? args.label : '本地模型'
+        const runOnce = async (text, label, extraDeny = []) => {
+          const started = await startChild(
+            subagents,
+            ctx,
+            {
+              label,
+              prompt: [{ type: 'text', text }],
+              parent: exec.agent,
+              signal: exec.signal,
+              agentOptions: { provider: now.provider, model },
+            },
+            extraDeny,
+          )
+          try {
+            return { text: resultText(await started.run.result), note: started.note }
+          } finally {
+            try {
+              await started.run.dispose?.()
+            } catch {
+              /* 释放失败不影响结果 */
+            }
+          }
+        }
+
+        /**
+         * 分批：每片 ≤chunkLines 行且 ≤8000 字符，最多 8 片；逐片归类后跑一次合并。
+         * 为什么要分批：实测同一模型同一任务，**33 行 → 100% 覆盖，115 行 → 59%** ——
+         * 它只会抓大类别，≤3 条的小类别会被丢掉。小口喂是唯一的解（见 README §9.1）。
+         */
+        const runChunked = async (rows, chunkLines) => {
+          const chunks = []
+          let cur = []
+          let curChars = 0
+          for (const r of rows) {
+            if (cur.length > 0 && (cur.length >= chunkLines || curChars + r.length > 8000)) {
+              chunks.push(cur)
+              cur = []
+              curChars = 0
+            }
+            cur.push(r)
+            curChars += r.length + 1
+          }
+          if (cur.length) chunks.push(cur)
+
+          const MAX_CHUNKS = 8
+          const used = chunks.slice(0, MAX_CHUNKS)
+          const t0 = Date.now()
+          const partials = []
+          for (let i = 0; i < used.length; i++) {
+            const head =
+              `\n\n=== 素材第 ${i + 1}/${used.length} 片（本片 ${used[i].length} 行；整批 ${rows.length} 行 / 共 ${chunks.length} 片）===\n`
+            const tail = '\n=== 本片素材结束 ===\n以上是**本片**的全部素材；请只归类这一片，不要推测其它片的内容。'
+            try {
+              const out = await runOnce(`${prompt}${head}${used[i].join('\n')}${tail}`, `${baseLabel}-片${i + 1}`, extraDeny)
+              partials.push({ ok: true, text: out.text, note: out.note })
+            } catch (e) {
+              partials.push({ ok: false, text: `（第 ${i + 1} 片失败：${String(e?.message ?? e)}）` })
+            }
+          }
+
+          const okParts = partials.filter((p) => p.ok)
+          let merged = ''
+          let mergeNote = ''
+          if (okParts.length === 0) {
+            merged = '所有分片都失败了，没有拿到任何结论。'
+          } else if (okParts.length === 1) {
+            merged = okParts[0].text
+            mergeNote = '（只有一片成功，未做合并）'
+          } else {
+            try {
+              const out = await runOnce(buildMergePrompt(okParts, used.length, chunks.length), `${baseLabel}-合并`, extraDeny)
+              merged = out.text
+              mergeNote = out.note
+            } catch (e) {
+              merged = okParts.map((p, i) => `--- 片${i + 1} ---\n${p.text}`).join('\n')
+              mergeNote = `⚠ 合并失败（${String(e?.message ?? e)}），以上为各片原文拼接，请自行去重`
+            }
+          }
+
+          const failed = partials.filter((p) => !p.ok).length
+          const notes = [
+            materialNote,
+            `[分批委派] ${used.length} 片 × ≤${chunkLines} 行` +
+              `${chunks.length > used.length ? `（素材共 ${chunks.length} 片，为控时只跑前 ${MAX_CHUNKS} 片）` : ''}` +
+              ` → ${used.length} 次分片归类 + ${okParts.length > 1 ? 1 : 0} 次合并，共 ${((Date.now() - t0) / 1000).toFixed(1)} 秒` +
+              `${failed ? `；⚠ ${failed} 片失败` : ''}`,
+            mergeNote,
+            ...partials.map((p) => p.note).filter(Boolean),
+          ].filter(Boolean)
+          return `${merged}\n\n${notes.join('\n')}`
+        }
+
+        // 素材由宿主代取（v1.5.0）；素材过大时自动分批 + 合并（v1.6.0）
         let material = ''
         let materialNote = ''
         let extraDeny = []
         if (args?.collect && typeof args.collect === 'object') {
           const c = await collectMaterial(args.collect)
+          materialNote =
+            `[宿主预取素材] ${c.files} 个文件 / ${c.lines} 行 / ${c.chars} 字符${c.truncated ? '（已按上限截断）' : ''}` +
+            (c.notes.length ? `；${c.notes.join('；')}` : '')
+          extraDeny = ['grep', 'glob']
+          const rows = c.text ? c.text.split('\n') : []
+          const chunkLines =
+            Number.isFinite(args.collect.chunkLines) && args.collect.chunkLines > 0
+              ? Math.min(Math.floor(args.collect.chunkLines), 500)
+              : 0
+          if (chunkLines > 0 && rows.length > chunkLines) {
+            return await runChunked(rows, chunkLines)
+          }
           material =
             `\n\n=== 素材（宿主侧已预取：${c.files} 个文件 / 命中 ${c.lines} 行 / ${c.chars} 字符` +
             `${c.truncated ? '，⚠ 已按上限截断' : ''}；共扫描 ${c.scanned} 行）===\n` +
             c.text +
             '\n=== 素材结束 ===\n' +
             '以上**就是本任务的全部素材**，请只基于它作答；不要自己去读文件或检索（取数工具已禁用）。'
-          materialNote =
-            `[宿主预取素材] ${c.files} 个文件 / ${c.lines} 行 / ${c.chars} 字符${c.truncated ? '（已截断）' : ''}` +
-            (c.notes.length ? `；${c.notes.join('；')}` : '')
-          extraDeny = ['grep', 'glob']
         }
         const childPrompt = material ? `${prompt}${material}` : prompt
 
-        const started = await startChild(
-          subagents,
-          ctx,
-          {
-            label: typeof args?.label === 'string' && args.label ? args.label : '本地模型',
-            prompt: [{ type: 'text', text: childPrompt }],
-            parent: exec.agent,
-            signal: exec.signal,
-            agentOptions: { provider: now.provider, model },
-          },
-          extraDeny,
-        )
-        const run = started.run
         // 只读保证的三层（从强到弱）：
         //  ① toolFilter deny 掉写/执行/再派活类工具（见 READONLY_DENY；不可用的名字逐个剔除并如实告知）
         //  ② 任务本身是采集类 prompt，验收在调用方做
         //  ③ 子代理看不到本对话，独立上下文
         // 刻意不用 maxDepth: 0 —— 那表示"禁止任何委派"，会把子代理卡在启动前（实测踩过）。
-        try {
-          const body = resultText(await run.result)
-          const notes = [materialNote, started.note].filter(Boolean).join('\n')
-          return notes ? `${body}\n\n${notes}` : body
-        } finally {
-          try {
-            await run.dispose?.()
-          } catch {
-            /* 释放失败不影响结果 */
-          }
-        }
+        const out = await runOnce(childPrompt, baseLabel, extraDeny)
+        const notes = [materialNote, out.note].filter(Boolean).join('\n')
+        return notes ? `${out.text}\n\n${notes}` : out.text
       },
     }),
   )
