@@ -1074,12 +1074,18 @@ export function apply(ctx, rawConfig) {
         // 模式（v1.7.0）：调用方给的 mode 优先，否则用设置里的默认
         const modeKey = normalizeMode(args?.mode) ?? normalizeMode(now.mode) ?? 'balanced'
         const mode = MODES[modeKey]
+        // 有效模型：调用方传的 model 优先（v1.11.2 修正 —— 档案校验必须按**有效模型**，
+        // 不能按配置模型，否则用 model 参数换模型时会拿上一个模型的档案与参数去跑）
+        const model = String(args?.model ?? '').trim() || now.model
+        if (!model) {
+          throw new Error('尚未指定本地模型。请在「设置 → 本地模型」里选一个，或在本工具调用里传 model 参数。')
+        }
         // 校准标识（v1.10.0）：有效则覆盖三个"机器相关"默认值 —— 素材上限 / 一口行数 / 输出行数
-        const ctxWindow = now.model ? await modelContextWindow(ctx.get('llm'), now.provider, now.model) : null
-        const dig = now.model ? await digestOf(resolveBaseURL(now.baseURL), now.model).catch(() => null) : null
+        const ctxWindow = await modelContextWindow(ctx.get('llm'), now.provider, model)
+        const dig = await digestOf(resolveBaseURL(now.baseURL), model).catch(() => null)
         const cal = await readCalibration({
           provider: now.provider,
-          model: now.model,
+          model,
           contextWindow: ctxWindow,
           modelDigest: dig?.digest ?? null,
           ollamaVersion: dig?.ollamaVersion ?? null,
@@ -1098,7 +1104,7 @@ export function apply(ctx, rawConfig) {
             : { maxChars: mode.maxChars, chunkLines: mode.chunkLines, maxRows: mode.maxRows }
         const capacityNote =
           cal.state === 'calibrated'
-            ? `[容量] 已校准（模型 ${now.model}）：上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines || '不分批'} 行 / 输出 ${tuned.maxRows} 行` +
+            ? `[容量] 已校准（模型 ${model}）：上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines || '不分批'} 行 / 输出 ${tuned.maxRows} 行` +
               (cal.warn ? `\n[容量提示] ${cal.warn}` : '')
             : `[容量] ${
                 cal.state === 'missing'
@@ -1132,12 +1138,6 @@ export function apply(ctx, rawConfig) {
           )
         }
         const verifyNote = `[验收建议] ${kind.verify}`
-        const model = String(args?.model ?? '').trim() || now.model
-        if (!model) {
-          throw new Error(
-            '尚未指定本地模型。请在「设置 → 本地模型」里选一个，或在本工具调用里传 model 参数。',
-          )
-        }
         const subagents = subagentsOf()
         if (!subagents) throw new Error('subagents 服务不可用，无法委派')
 
