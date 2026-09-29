@@ -1,7 +1,7 @@
 ---
 doc: usage-declaration
-plugin: "@local/dsh-local-ollama-models"
-version: 1.12.0
+plugin: "@local/dsh-localmodels-tokensavior"
+version: 1.13.0
 audience: AI agent（人类也可直接阅读）
 purpose: 让任何一台刚装上本插件的机器上的 AI，无需历史对话即可正确启用、使用并验收本插件
 host-tools: [ollama_local_models, subagent_local]
@@ -16,7 +16,7 @@ integrity: 本文件与 package.json 的 version 应当一致；不一致说明�
 
 # 这个插件能干啥：让你的 DSH 调用本地模型，帮你省些大白饭（token）
 
-**本地模型子代理 · 使用声明** ｜ DSH 插件 ｜ 设置页在「设置 → 本地模型」
+**DSH-LocalModels-TokenSavior**（本地模型子代理）· 使用声明 ｜ DSH 插件 ｜ 设置页在「设置 → 本地模型」
 
 > 让它**调用本机 Ollama 模型当"子代理"用**，干一些它力所能及的活（读大文件、扫日志、归类、抽取、问答、看图）
 > —— **原文不进你的上下文、只有结论回来**，帮你省下一些大白饭（token）。
@@ -38,12 +38,12 @@ integrity: 本文件与 package.json 的 version 应当一致；不一致说明�
 
 **A. 从 GitHub 直接装**（推荐，跟着仓库更新）
 
-在 DSH 里让 AI 执行：`plugin_manager` → `action: install_bundle` → `target: "github:Movingelated/dsh-local-ollama-models"`。
+在 DSH 里让 AI 执行：`plugin_manager` → `action: install_bundle` → `target: "github:Movingelated/DSH-LocalModels-TokenSavior"`。
 
 **B. 克隆后按路径装**
 
 ```bash
-git clone https://github.com/Movingelated/dsh-local-ollama-models.git
+git clone https://github.com/Movingelated/DSH-LocalModels-TokenSavior.git
 ```
 
 然后 `install_bundle` 的 `target` 填**克隆到的绝对路径**。
@@ -159,7 +159,7 @@ OLLAMA_API_KEY: ollama-local-no-key-required
 ollama ps                                   # 看模型是否 100% GPU 驻留
 ```
 ```
-cordis_inspect_query host / Config / listConfigs  {name: "@local/dsh-local-ollama-models"}
+cordis_inspect_query host / Config / listConfigs  {name: "@local/dsh-localmodels-tokensavior"}
   → status 应为 "schema"（为 "absent" 说明 Config 没加载，设置页将不可写）
 cordis_inspect_query host / Tool / listTools
   → 应能看到 ollama_local_models 与 subagent_local

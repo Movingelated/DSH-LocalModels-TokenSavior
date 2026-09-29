@@ -15,7 +15,7 @@
 # 最优用法、验收纪律、排错表：见同目录 README.md。
 - insert:
     - id: local-ollama-models
-      name: '@local/dsh-local-ollama-models'
+      name: '@local/dsh-localmodels-tokensavior'
       config:
         enabled: false
         model: ''

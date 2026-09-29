@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "本地 Ollama 模型",
-    "description": "查询本机 Ollama 状态与模型，并把只读采集任务委派给本地模型，零云端 token 成本。提供「设置 → 本地模型」面板（开关 / 选模型 / 端点）。"
+    "title": "DSH-LocalModels-TokenSavior",
+    "description": "本地模型子代理：查询本机 Ollama 状态与模型，并把只读采集任务委派给本地模型，零云端 token 成本。提供「设置 → 本地模型」面板（开关 / 选模型 / 端点）。"
   }
 }

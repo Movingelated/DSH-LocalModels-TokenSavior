@@ -1,5 +1,5 @@
 /**
- * 本地 Ollama 模型 —— 客户端半身（「设置 → 本地模型」独立栏目）
+ * DSH-LocalModels-TokenSavior（本地模型子代理）—— 客户端半身（「设置 → 本地模型」独立栏目）
  *
  * 血的教训（上次把整个前端搞崩的原因）：
  *   React Hook 绝不能出现在 factory(require) 的执行路径上，只能在组件渲染时调用。
@@ -14,7 +14,7 @@
  * 命名空间缺失时面板会给出诊断，而不是假装能点。
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-local-ollama-models',
+  id: '@local/dsh-localmodels-tokensavior',
   factory(require) {
     let React;
     try {
@@ -485,7 +485,7 @@ window.__ModuleLoader__.load({
       if (err) out.push(h('div', { key: 'err', style: S.alert }, err));
 
       out.push(h('div', { key: 'foot', style: S.hint },
-        '说明：本栏目由插件 local-ollama-models v1.12.0 提供。完整说明书（用法 / 前置条件 / 验收纪律 / 排错）' +
+        '说明：本栏目由插件 DSH-LocalModels-TokenSavior（本地模型子代理）v1.13.0 提供。完整说明书（用法 / 前置条件 / 验收纪律 / 排错）' +
         '在插件目录的 README.md；在「插件」页停用该 bundle 也能关闭全部功能。'));
 
       return h('div', { style: S.wrap }, out);

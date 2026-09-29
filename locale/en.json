@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Local Ollama Models",
-    "description": "Query local Ollama status and models, and delegate read-only collection tasks to a local model at zero cloud token cost. Ships a Settings → Local Models panel (toggle / model pick / endpoint)."
+    "title": "DSH-LocalModels-TokenSavior",
+    "description": "Local-model subagent: query local Ollama status and models, and delegate read-only collection tasks to a local model at zero cloud token cost. Ships a Settings → Local Models panel (toggle / model pick / endpoint)."
   }
 }
