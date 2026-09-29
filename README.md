@@ -1,7 +1,7 @@
 ---
 doc: usage-declaration
 plugin: "@local/dsh-local-ollama-models"
-version: 1.10.1
+version: 1.10.2
 audience: AI agent（人类也可直接阅读）
 purpose: 让任何一台刚装上本插件的机器上的 AI，无需历史对话即可正确启用、使用并验收本插件
 host-tools: [ollama_local_models, subagent_local]
@@ -400,8 +400,16 @@ subagent_local({
 |---|---|---|---|
 | ① 容量 | 模型声明的上下文窗口 | 插件自动读（`ollama_local_models` 会显示）；读不到就问那台机器的人 | `contextWindow`；再算 `maxChars ≈ (contextWindow − 8192) × 2.4` |
 | ② 吞吐 | tok/s | `node bench.mjs <模型id>` | `evidence.throughputTokPerSec`（决定"愿不愿意为分批等"） |
-| ③ **胃口**（最关键） | "一口多少行时召回还够" | 造一份**已知答案**的合成素材，取 **30 / 60 / 120 行**各跑一次 `kind=classify`，比对召回 → 取"仍 ≥90% 的最大点"当 `chunkLines`；三点都 <90% 就压到 20，并接受"这台机器必须复核" | `chunkLines` + `evidence.appetiteProbe` |
-| ④ 能力矩阵 | 这台模型能做哪几种 kind | 跑一次最小 `kind=extract`（输出能否 `JSON.parse`）+ 一次 `kind=code`（工具参数有没有被改坏，见 §7 第 9 条） | `evidence.kinds.*` |
+| ③ **胃口**（最关键） | "一口多少行时召回还够" | **两个探针一起跑**（只用合成素材会得到过于乐观的参数）：<br>**① 规则合成素材**（同类行重复，如 4 类 / 30·60·120 行）→ 量"容量型"上限；<br>**② 真实杂乱素材**（多种措辞 + 长尾小类 + 重复行，答案要能机械核对）→ 量"真实"上限。<br>**`chunkLines` 取 ② 的结果**：取"仍 ≥90% 的最大行数"；都 <90% 就压到 20，并接受"这台机器必须复核" | `chunkLines` + `evidence.appetiteProbe`（每点标注 `material: synthetic-regular` / `real-messy`） |
+| ④ 能力矩阵 | 这台模型能做哪几种 kind | 跑一次最小 `kind=extract`（输出能否 `JSON.parse`）+ 一次 `kind=code` —— **`code` 要连看两个环节**：工具**调没调**（看子代理账本的"自调工具"次数）与**最后写出来的东西对不对** | `evidence.kinds.*` |
+
+> ⚠️ **两个必须知道的实测反例**（本机 `qwen3:30b-a3b` 校准过程中踩到的）：
+>
+> 1. **合成素材 ≠ 真实难度**：合成 120 行（4 类规则重复）**100% 全对**；真实杂乱 115 行只有 **59%**（长尾小类被丢）。
+>    所以 ① 只用来量"容量上限"，**定 `chunkLines` 必须用 ②**。本机最终取保守的 **40 行**。
+> 2. **工具调用"成功"不等于任务成功**：`kind=code` 那次，子代理**确实调了** `glob` + `grep`×2 且参数没坏，
+>    但**最终汇总崩了**（`ITEMS=0`、输出退化成一行、还编造出处 `plugins/local-ollama-models:0`）→ 该 kind 判 **unusable**。
+>    **账本里的"自调工具次数"只说明它动了手，不说明它做对了事。**
 
 #### 判据：什么叫"召回够"
 
