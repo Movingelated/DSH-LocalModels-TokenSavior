@@ -14,7 +14,7 @@ hard-requirements:
 integrity: 本文件与 package.json 的 version 应当一致；不一致说明插件被改过，优先信任代码
 ---
 
-# 这个插件能干啥：让你的 DSH 调用本机模型，帮你省些大白饭（token）
+# 这个插件能干啥：让你的 DSH 调用本地模型，帮你省些大白饭（token）
 
 **本地模型子代理 · 使用声明** ｜ DSH 插件 ｜ 设置页在「设置 → 本地模型」
 
