@@ -12,3 +12,6 @@ Thumbs.db
 # 日志与临时文件
 *.log
 *.tmp
+
+# 本机校准标识（机器相关，绝不入库/发布）
+calibration.json

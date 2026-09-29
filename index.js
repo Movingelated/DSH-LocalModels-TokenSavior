@@ -39,6 +39,125 @@ const PLUGIN_DIR = (() => {
 const README_PATH = PLUGIN_DIR ? path.join(PLUGIN_DIR, 'README.md') : 'README.md'
 
 /**
+ * 校准标识文件（v1.10.0）：由"跑过四步校准"的 AI 自己写入（流程见 README §5.7），插件**只读 + 校验**。
+ * 可用环境变量覆盖路径（测试用；也方便把标识放到别处）。
+ */
+export const CALIBRATION_PATH =
+  String(process.env.DSH_LOCAL_OLLAMA_CALIBRATION ?? '').trim() ||
+  (PLUGIN_DIR ? path.join(PLUGIN_DIR, 'calibration.json') : 'calibration.json')
+const CALIBRATION_SCHEMA = 1
+
+/**
+ * 读并校验校准标识 —— **标识是 AI 的自述，不是证明**，所以插件不信它，只读它、校验它：
+ *  · 文件不在 → missing；JSON 坏了 / schema 不对 → invalid
+ *  · provider / model / contextWindow 与当前不一致 → **stale**（换模型必须重校准，否则"大模型配小参数"）
+ * 返回 { state: 'calibrated' | 'stale' | 'missing' | 'invalid', data?, reason? }
+ */
+export async function readCalibration(expected = {}) {
+  let raw = ''
+  try {
+    raw = await readFile(CALIBRATION_PATH, 'utf8')
+  } catch {
+    return { state: 'missing' }
+  }
+  let data = null
+  try {
+    data = JSON.parse(raw)
+  } catch {
+    return { state: 'invalid', reason: 'JSON 解析失败' }
+  }
+  if (!data || typeof data !== 'object') return { state: 'invalid', reason: '顶层不是对象' }
+  if (data.schema !== CALIBRATION_SCHEMA) {
+    return { state: 'invalid', reason: `schema=${String(data.schema)}（期望 ${CALIBRATION_SCHEMA}）` }
+  }
+  const expModel = String(expected.model ?? '').trim()
+  const expProvider = String(expected.provider ?? '').trim()
+  if (expModel && data.model && String(data.model) !== expModel) {
+    return { state: 'stale', data, reason: `校准的是 "${data.model}"，当前模型是 "${expModel}"` }
+  }
+  if (expProvider && data.provider && String(data.provider) !== expProvider) {
+    return { state: 'stale', data, reason: `校准的路由是 "${data.provider}"，当前是 "${expProvider}"` }
+  }
+  const expCtx = Number(expected.contextWindow)
+  const gotCtx = Number(data.capacity?.contextWindow)
+  if (Number.isFinite(expCtx) && expCtx > 0 && Number.isFinite(gotCtx) && gotCtx !== expCtx) {
+    return { state: 'stale', data, reason: `校准的上下文 ${gotCtx} ≠ 当前声明的 ${expCtx}` }
+  }
+  return { state: 'calibrated', data }
+}
+
+/** 读模型声明的上下文窗口（拿不到就返回 null —— 不猜）。 */
+async function modelContextWindow(llm, provider, model) {
+  try {
+    const info = await llm?.resolveModelInfo?.(provider, model)
+    const n = Number(info?.context?.contextWindow)
+    return Number.isFinite(n) && n > 0 ? n : null
+  } catch {
+    return null
+  }
+}
+
+/** 给 AI 抄的校准文件模板（放在 ollama_local_models 的输出里，省得它猜格式）。 */
+function calibrationTemplate() {
+  return JSON.stringify(
+    {
+      schema: CALIBRATION_SCHEMA,
+      calibratedAt: '<ISO 时间>',
+      calibratedBy: '<DSH 会话 / 模型>',
+      provider: '<路由，如 ollama-local>',
+      model: '<模型 id>',
+      env: { endpoint: '<端点>', ollamaVersion: '<版本>', gpu: '<显卡>', vramGB: 0 },
+      capacity: { contextWindow: 32768, maxChars: 60000, chunkLines: 40, maxRows: 12 },
+      evidence: {
+        throughputTokPerSec: 0,
+        appetiteProbe: [
+          { lines: 30, recall: 0 },
+          { lines: 60, recall: 0 },
+          { lines: 120, recall: 0 },
+        ],
+        kinds: { classify: 'untested', qa: 'untested', extract: 'untested', summary: 'untested', code: 'untested' },
+      },
+      notes: '',
+    },
+    null,
+    2,
+  )
+}
+
+/** 校准状态段落（**免费通道**：改这里不砸 prompt 前缀缓存）。 */
+export function renderCalibration(cal, ctxWindow = null) {
+  if (cal.state === 'calibrated') {
+    const c = cal.data.capacity ?? {}
+    return (
+      '[校准] ✅ 已校准' +
+      `（${cal.data.calibratedAt ?? '时间未知'}，模型 ${cal.data.model ?? '?'}）\n` +
+      `  容量：上下文 ${c.contextWindow ?? '?'} / 素材上限 ${c.maxChars ?? '?'} 字符 / 一口 ${c.chunkLines ?? '?'} 行 / 输出 ${c.maxRows ?? '?'} 行\n` +
+      '  这些值会作为**默认参数**生效（调用时显式传参仍可覆盖）。'
+    )
+  }
+  const why =
+    cal.state === 'missing'
+      ? '⚠️ 未校准'
+      : cal.state === 'stale'
+        ? `⚠️ 标识已过期（${cal.reason}）`
+        : `⚠️ 标识不可用（${cal.reason}）`
+  const suggestion =
+    ctxWindow && ctxWindow > 8192
+      ? `\n  （已读到本机声明上下文 ${ctxWindow} token → 素材上限建议 ≈ ${Math.round(((ctxWindow - 8192) * 2.4) / 1000)}k 字符）`
+      : ''
+  return (
+    `[校准] ${why} —— 当前按**保守默认**运行（素材上限 60000 字符；一口行数取当前模式的阈值 40~120 行）。\n` +
+    `  建议先做一次「四步容量校准」（步骤见 README §5.7），然后把结果 JSON 写到：\n  ${CALIBRATION_PATH}\n` +
+    '  模板（照抄改值；**模型或上下文一变就必须重校准**）：\n' +
+    calibrationTemplate()
+      .split('\n')
+      .map((l) => '  ' + l)
+      .join('\n') +
+    suggestion
+  )
+}
+
+/**
  * 委派给本地模型时禁掉的工具：写/执行类 + 再派活类。
  *
  * 目的：让"只读采集工人"这个承诺由**机制**保证，而不是只靠 prompt 的自觉。
@@ -387,7 +506,7 @@ function normalizeKind(raw) {
 /** 按 (任务类型, 模式) 把"任务一句话"套成完整提示词：角色 + 铁律 + 输出契约。 */
 export function buildPromptFor(kindKey, modeKey, task, opts = {}) {
   const kind = KINDS[kindKey] ?? KINDS.classify
-  const mode = MODES[modeKey] ?? MODES.balanced
+  const mode = { ...(MODES[modeKey] ?? MODES.balanced), ...(opts.tuned ?? {}) }
   const withMaterial = opts.withMaterial !== false
   const head =
     `你是本地只读采集工人（任务类型：${kind.label}）。任务：${String(task ?? '').trim()}\n` +
@@ -419,6 +538,9 @@ const DELEGATION_POLICY =
   '规模只决定"值不值得"：单个文件 > 30 KB、或要扫 ≥ 3 个文件/日志时，派它能省下可观的上下文。\n' +
   '素材 > 32K token（≈100 KB）时**必须**先收窄：最有效的做法是先用 grep / pwsh 把大素材**去重归一化**成小文件再交给它' +
   '（实测 1.7 MB → 84 行），或者让 collect.pattern 只取匹配行 —— 本地模型只有 32K 上下文，整份塞进去会被截成残料。\n' +
+  '**换机器/换模型后首次使用前**：先按插件 README §5.7 跑一遍「四步容量校准」（读上下文窗口 / 量吞吐 / 三点测"一口多少行" / 测哪几种 kind 可用），' +
+  '把结果 JSON 写进插件目录的 calibration.json；**若该文件已存在且模型与上下文未变，直接用里面的参数，不要重复校准**' +
+  '（ollama_local_models 的输出会显示当前校准状态）。\n' +
   '派法：subagent_local({ kind, task, collect })，collect 给绝对路径；拿回结论后按插件 README §6 复核' +
   '（**分类与行号可信，计数必须自己数**）。若手上没有 subagent_local 工具、或它报"已关闭"，就照常自己读文件，忽略本节。'
 
@@ -704,8 +826,17 @@ export function apply(ctx, rawConfig) {
         render: (_args, value) => [{ type: 'text', text: String(value ?? '') }],
       },
       execute: async () => {
-        const body = renderStatus(await probe(resolveBaseURL(live().baseURL)))
-        return `${body}\n\n用法 / 前置条件 / 验收纪律见：${README_PATH}`
+        const now = live()
+        const ctxWindow = now.model ? await modelContextWindow(ctx.get('llm'), now.provider, now.model) : null
+        const cal = await readCalibration({ provider: now.provider, model: now.model, contextWindow: ctxWindow })
+        const body = renderStatus(await probe(resolveBaseURL(now.baseURL)))
+        return [
+          body,
+          renderCalibration(cal, ctxWindow),
+          `用法 / 前置条件 / 验收纪律见：${README_PATH}`,
+        ]
+          .filter(Boolean)
+          .join('\n\n')
       },
     }),
   )
@@ -803,6 +934,23 @@ export function apply(ctx, rawConfig) {
         // 模式（v1.7.0）：调用方给的 mode 优先，否则用设置里的默认
         const modeKey = normalizeMode(args?.mode) ?? normalizeMode(now.mode) ?? 'balanced'
         const mode = MODES[modeKey]
+        // 校准标识（v1.10.0）：有效则覆盖三个"机器相关"默认值 —— 素材上限 / 一口行数 / 输出行数
+        const ctxWindow = now.model ? await modelContextWindow(ctx.get('llm'), now.provider, now.model) : null
+        const cal = await readCalibration({ provider: now.provider, model: now.model, contextWindow: ctxWindow })
+        const tuned =
+          cal.state === 'calibrated'
+            ? {
+                maxChars: Number(cal.data.capacity?.maxChars) > 0 ? Number(cal.data.capacity.maxChars) : mode.maxChars,
+                chunkLines: Number(cal.data.capacity?.chunkLines) >= 0 ? Number(cal.data.capacity.chunkLines) : mode.chunkLines,
+                maxRows: Number(cal.data.capacity?.maxRows) > 0 ? Number(cal.data.capacity.maxRows) : mode.maxRows,
+              }
+            : { maxChars: mode.maxChars, chunkLines: mode.chunkLines, maxRows: mode.maxRows }
+        const capacityNote =
+          cal.state === 'calibrated'
+            ? `[容量] 已校准（模型 ${cal.data.model}）：上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines || '不分批'} 行 / 输出 ${tuned.maxRows} 行`
+            : `[容量] ${
+                cal.state === 'missing' ? '未校准' : cal.state === 'stale' ? `标识已过期（${cal.reason}）` : `标识不可用（${cal.reason}）`
+              } → 按保守默认（上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines} 行）；建议先跑 README §5.7 的四步校准`
         // 任务类型（v1.8.0）：不认识的名字直接报错，不悄悄回退成 classify
         const kindRaw = String(args?.kind ?? '').trim()
         if (kindRaw && !normalizeKind(kindRaw)) {
@@ -819,7 +967,7 @@ export function apply(ctx, rawConfig) {
         const prompt =
           manualPrompt ||
           (taskText
-            ? buildPromptFor(kindKey, modeKey, taskText, { withMaterial: Boolean(args?.collect) })
+            ? buildPromptFor(kindKey, modeKey, taskText, { withMaterial: Boolean(args?.collect), tuned })
             : '')
         if (!prompt) {
           throw new Error(
@@ -951,6 +1099,7 @@ export function apply(ctx, rawConfig) {
             mergeNote,
             ...partials.map((p) => p.note).filter(Boolean),
             verifyNote,
+            capacityNote,
           ].filter(Boolean)
           return `${merged}\n\n${[...new Set(notes)].join('\n')}`
         }
@@ -961,7 +1110,7 @@ export function apply(ctx, rawConfig) {
         let extraDeny = []
         if (args?.collect && typeof args.collect === 'object') {
           const spec = { ...args.collect }
-          const maxChars = Math.max(mode.maxChars, kind.minChars)
+          const maxChars = Math.max(tuned.maxChars, kind.minChars)
           if (spec.maxChars === undefined) spec.maxChars = maxChars
           const c = await collectMaterial(spec)
           // 禁止分片的类型（qa / code）：素材超单次预算就报错，绝不悄悄截断或分片
@@ -976,7 +1125,7 @@ export function apply(ctx, rawConfig) {
           materialNote =
             `[任务类型] ${kind.label}\n` +
             `[模式] ${mode.label}（素材上限 ${maxChars} / 分批阈值 ${
-              kind.noChunk ? '禁用（类型要求）' : mode.chunkLines || '关闭'
+              kind.noChunk ? '禁用（类型要求）' : tuned.chunkLines || '关闭'
             }）\n` +
             `[宿主预取素材] ${c.files} 个文件 / ${c.lines} 行 / ${c.chars} 字符${c.truncated ? '（已按上限截断）' : ''}` +
             (c.notes.length ? `；${c.notes.join('；')}` : '')
@@ -985,7 +1134,7 @@ export function apply(ctx, rawConfig) {
           const chunkLines = kind.noChunk
             ? 0
             : args.collect.chunkLines === undefined
-              ? mode.chunkLines
+              ? tuned.chunkLines
               : Number.isFinite(args.collect.chunkLines) && args.collect.chunkLines > 0
                 ? Math.min(Math.floor(args.collect.chunkLines), 500)
                 : 0
@@ -1011,7 +1160,7 @@ export function apply(ctx, rawConfig) {
         const tSingle = Date.now()
         const out = await runOnce(childPrompt, baseLabel, extraDeny)
         const timingNote = `[耗时] ${((Date.now() - tSingle) / 1000).toFixed(1)} 秒（1 次本地推理）`
-        const notes = [materialNote, out.note, verifyNote, timingNote].filter(Boolean).join('\n')
+        const notes = [materialNote, capacityNote, out.note, verifyNote, timingNote].filter(Boolean).join('\n')
         return notes ? `${out.text}\n\n${notes}` : out.text
       },
     }),
