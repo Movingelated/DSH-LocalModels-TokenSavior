@@ -104,6 +104,40 @@ function readonlyNote(dropped, all) {
 }
 
 /**
+ * 写进**系统提示词**的委派政策段落 —— 本插件最重要的一次"行为修正"。
+ *
+ * 为什么需要它：工具描述只说"我能做什么"，不会在具体情境里主动冒出来。
+ * 实测：插件上线后本会话 250 次工具调用里，本插件共 6 次，**全部是用户点名要求演示的，自发调用 0 次**。
+ * 所以必须把"什么时候该委派"写成一条常驻规则，放进每一次请求都看得见的系统提示词。
+ *
+ * ⚠ 文本刻意保持**静态**（不含 enabled/model 等状态）：系统提示词在最前面，文本一变整条
+ *   prompt 前缀缓存作废，几十万 token 的会话要重新 prefill（实测踩过 166 秒零 token）。
+ *   功能关闭时也不改文本 —— 靠最后一句"报已关闭就自己读"降级。
+ */
+const DELEGATION_POLICY =
+  '[本地模型子代理] 本机装了 local-ollama-models 插件，它提供 subagent_local 工具：把**只读采集任务**交给本机 Ollama 模型，' +
+  '在独立上下文里执行、只回结论 —— 那部分 token 不花钱，也不占主上下文。\n' +
+  '命中任一条件就**优先委派**，不要把原文读进主上下文：① 要读的单个文件 > 30 KB；② 要扫 ≥ 3 个文件/日志；' +
+  '③ 任务本质是计数、去重、字段抽取、找关键行、图片转文字。\n' +
+  '委派要求：prompt 必须自包含（绝对路径 + 要什么 + 输出格式）；拿回结论后按插件 README §6 复核（分类可信、**计数必须自己数**）。\n' +
+  '若手上没有 subagent_local 工具，或它报"已关闭"，就照常自己读文件，忽略本节。'
+
+/** 触发"读大文件"提示的阈值（字符数）。 */
+const BIG_READ_CHARS = 30000
+
+/** 读进主上下文的大文件提示：在**花掉钱的当场**提醒下次可以委派。 */
+function bigReadNudge(chars) {
+  const kb = Math.round(chars / 1024)
+  const kTok = Math.round(chars / 3.2 / 1000)
+  return (
+    '\n——\n' +
+    `⚠ 采集提示：上面这份内容约 ${kb} KB（≈${kTok}k token）已进入主上下文，之后每一轮都要为它付费。\n` +
+    '下次遇到"读大文件 / 扫一批日志，只要结论"的采集任务，可先调 subagent_local 交给本机 Ollama 模型 —— 那部分 token 零成本。' +
+    '（prompt 要自包含；拿回结论按插件 README §6 复核）'
+  )
+}
+
+/**
  * 载入 schemastery —— Config schema 唯一需要的东西。
  *
  * 为什么不是 `import z from '@deepseek-ai/schemastery'`：
@@ -388,7 +422,9 @@ export function apply(ctx, rawConfig) {
         '适用：读大文件后只回结论、扫日志找关键行、统计计数、图片转文字。' +
         '不适用：写文件、改代码、架构判断、产出最终交付文案。' +
         '本地模型在独立上下文里工作，看不到本对话，因此 prompt 必须自包含；只有它的结论会回到这里。' +
-        '派活前建议先读插件 README.md 的「最优使用法」与「验收纪律」（路径见 ollama_local_models 的输出）。',
+        '触发条件（命中任一就该用本工具，而不是自己 read）：单个文件 > 30 KB、要扫 ≥3 个文件/日志、' +
+        '或任务本质是计数 / 去重 / 字段抽取 / 找关键行 / 图片转文字。' +
+        '用法与验收纪律见插件 README.md（路径见 ollama_local_models 的输出）。',
       parameters: {
         type: 'object',
         properties: {
@@ -469,6 +505,68 @@ export function apply(ctx, rawConfig) {
       },
     }),
   )
+
+  // ── 主动性机制一：把"什么时候该委派"写进系统提示词 ────────────────
+  // systemPrompt 服务可能比本插件晚就绪（roleplay 插件踩过同一个坑），所以带定时重试。
+  let policyDisposer = null
+  let policyTimer = null
+  const tryRegisterPolicy = () => {
+    if (policyDisposer) return true
+    const prompt = typeof ctx.get === 'function' ? ctx.get('systemPrompt') : undefined
+    if (!prompt || typeof prompt.section !== 'function') return false
+    policyDisposer = prompt.section({ name: 'local-ollama-delegation', order: 2850, text: DELEGATION_POLICY })
+    ctx.logger?.info?.('[local-ollama] 已注册系统提示词段落 local-ollama-delegation（委派政策）')
+    return true
+  }
+  if (!tryRegisterPolicy()) {
+    let tries = 0
+    policyTimer = setInterval(() => {
+      if (tryRegisterPolicy() || ++tries > 40) {
+        clearInterval(policyTimer)
+        policyTimer = null
+      }
+    }, 1500)
+    if (typeof policyTimer?.unref === 'function') policyTimer.unref()
+  }
+  ctx.effect(() => () => {
+    if (policyTimer) clearInterval(policyTimer)
+    try {
+      policyDisposer?.()
+    } catch {
+      /* 释放失败不影响卸载 */
+    }
+  })
+
+  // ── 主动性机制二：读了大文件就当场提醒（花掉钱的那一刻）──────────
+  // 用 tools/post-execute 给结果**追加**一个文本块：accept 决策只替换 content，
+  // 原来的 value/meta 都被保留（dsh-tools 的 postExecute 实现），因此界面卡片不受影响。
+  // 每个 agent 只提醒一次，避免变成噪音。
+  const nudgedAgents = new Set()
+  ctx.on('tools/post-execute', async (exec, result, next) => {
+    const downstream = await next()
+    try {
+      if (!live().enabled) return downstream
+      if (!downstream || downstream.kind !== 'accept') return downstream
+      if (exec?.name !== 'read') return downstream
+      const blocks = Array.isArray(downstream.content)
+        ? downstream.content
+        : Array.isArray(result?.content)
+          ? result.content
+          : []
+      const chars = blocks.reduce(
+        (n, b) => n + (b && b.type === 'text' && typeof b.text === 'string' ? b.text.length : 0),
+        0,
+      )
+      if (chars < BIG_READ_CHARS) return downstream
+      const key = String(exec?.agent?.id ?? 'anon')
+      if (nudgedAgents.has(key)) return downstream
+      if (nudgedAgents.size > 200) nudgedAgents.clear()
+      nudgedAgents.add(key)
+      return { ...downstream, content: [...blocks, { type: 'text', text: bigReadNudge(chars) }] }
+    } catch {
+      return downstream // 提示本身绝不能影响工具结果
+    }
+  })
 
   ctx.logger?.info?.(`[local-ollama] 已注册委派工具 ${toolName}（开关在调用时判定）`)
 }
