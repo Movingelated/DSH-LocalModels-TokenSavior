@@ -16,6 +16,12 @@ integrity: 本文件与 package.json 的 version 应当一致；不一致说明�
 
 # 本地模型子代理 · 使用声明
 
+> **这个插件到底是干什么的**：让你的 DSH 能调用**本机 Ollama 模型**当"子代理"用，干一些它力所能及的活
+> （读大文件、扫日志、归类、抽取、问答、看图）—— **原文不进你的上下文、只有结论回来**，
+> 帮你省下一些**大白饭**（token）。
+>
+> 它不万能，先记住一句：**分类与行号可信，计数必须自己数**（§6）；哪些活该派、哪些别派，看 §5.1。
+
 > **DSH (DeepSeek Harness) plugin** — delegate *read-only collection tasks* (scan logs, extract fields,
 > count, dedupe, read a large file and return only the conclusion) to a **local Ollama model**:
 > zero cloud token cost, zero API keys. Ships a Settings panel, a model-selection ruler (`bench.mjs`),
