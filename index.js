@@ -194,7 +194,8 @@ function buildMergePrompt(parts, ran, total) {
   return (
     `你是本地只读采集工人。下面是同一批素材被切成 ${total} 片后、各自归类的结果` +
     `${total > ran ? `（本次只跑了前 ${ran} 片）` : ''}。\n` +
-    '请把它们**合并去重成一张最终表**：同一根因合并为一行、次数相加、保留一个代表原文与出处；不要新增分片里没有的类别。\n' +
+    '请把它们**合并去重成一张最终表**：同一根因合并为一行、次数相加、保留一个代表原文与出处；不要新增分片里没有的类别；' +
+    '**次数只汇总各片报出的数字，不要重新估算、也不要重复计数**。\n' +
     '输出格式（严格照此，不要开场白、不要解释、不要建议）：\n' +
     '分类 | 次数 | 代表原文(最多80字) | 出处(文件名:行号)\n（按次数从多到少排序）\nTOTAL=<次数合计>\n\n' +
     body
@@ -690,7 +691,7 @@ export function apply(ctx, rawConfig) {
             mergeNote,
             ...partials.map((p) => p.note).filter(Boolean),
           ].filter(Boolean)
-          return `${merged}\n\n${notes.join('\n')}`
+          return `${merged}\n\n${[...new Set(notes)].join('\n')}`
         }
 
         // 素材由宿主代取（v1.5.0）；素材过大时自动分批 + 合并（v1.6.0）
