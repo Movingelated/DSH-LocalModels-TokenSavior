@@ -21,6 +21,8 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readFile, readdir, stat } from 'node:fs/promises'
+import os from 'node:os'
+import { createHash } from 'node:crypto'
 
 /**
  * 本插件目录与说明书路径。
@@ -46,6 +48,49 @@ export const CALIBRATION_PATH =
   String(process.env.DSH_LOCAL_OLLAMA_CALIBRATION ?? '').trim() ||
   (PLUGIN_DIR ? path.join(PLUGIN_DIR, 'calibration.json') : 'calibration.json')
 const CALIBRATION_SCHEMA = 2
+
+/**
+ * 本机指纹 —— **只用于提示"这份档案来自另一台机器"，不作为失效条件**。
+ * 为什么不做成失效条件：档案里记的是**模型**的参数（上下文容量、一口多少行），
+ * 那是模型的属性、不是机器的属性；同名同 digest 的模型换台机器跑，参数依然成立，
+ * 强制重跑只会白花 5-8 分钟（跟"换模型要校准、换回来直接用"是同一个道理）。
+ */
+export const MACHINE_HASH = (() => {
+  try {
+    const raw = `${os.hostname?.() ?? ''}|${os.platform?.() ?? ''}|${os.arch?.() ?? ''}|${process.env.COMPUTERNAME ?? ''}|${process.env.USERNAME ?? ''}`
+    return createHash('sha256').update(raw).digest('hex').slice(0, 12)
+  } catch {
+    return ''
+  }
+})()
+
+/**
+ * 轻量取某模型的 digest（+ Ollama 版本），带 60 秒缓存。
+ * 为什么不用 probe()：那会为**每个**模型各打一次 /api/show，24 个模型就是 1 秒多 —— 委派路径上太贵。
+ */
+let digestCache = { at: 0, baseURL: '', version: null, models: {} }
+async function digestOf(baseURL, modelId) {
+  const now = Date.now()
+  if (digestCache.baseURL !== baseURL || now - digestCache.at > 60000) {
+    const models = {}
+    let version = null
+    try {
+      const tags = await reqJSON(`${baseURL}/api/tags`, {}, 5000)
+      for (const m of Array.isArray(tags?.models) ? tags.models : []) models[m.name] = m.digest ?? null
+    } catch {
+      /* 拿不到就返回空，由调用方按"未知"处理 */
+    }
+    try {
+      version = (await reqJSON(`${baseURL}/api/version`, {}, 3000))?.version ?? null
+    } catch {
+      /* 版本拿不到不影响 digest 判断 */
+    }
+    digestCache = { at: now, baseURL, version, models }
+  }
+  const id = String(modelId ?? '').trim()
+  const digest = digestCache.models[id] ?? digestCache.models[`${id}:latest`] ?? null
+  return { digest, ollamaVersion: digestCache.version }
+}
 
 /**
  * 读并校验校准标识 —— **标识是 AI 的自述，不是证明**，所以插件只读它、校验它。
@@ -116,7 +161,46 @@ export async function readCalibration(expected = {}) {
       reason: `"${key}" 的档案记的是上下文 ${gotCtx}，当前声明 ${expCtx} → 只废掉这一份`,
     }
   }
-  return { state: 'calibrated', profile, keys }
+
+  // ── 值域校验：手写/伪造的离谱数字直接判 invalid（"看起来合理"的伪造只能靠抽样复核，见 README §5.7）──
+  const cLines = Number(profile.capacity?.chunkLines)
+  const cChars = Number(profile.capacity?.maxChars)
+  const cRows = Number(profile.capacity?.maxRows)
+  if (!Number.isFinite(cLines) || cLines < 0 || cLines > 500) {
+    return { state: 'invalid', profile, keys, reason: `chunkLines=${String(profile.capacity?.chunkLines)} 越界（允许 0~500）` }
+  }
+  if (!Number.isFinite(cChars) || cChars < 5000 || cChars > 400000) {
+    return { state: 'invalid', profile, keys, reason: `maxChars=${String(profile.capacity?.maxChars)} 越界（允许 5000~400000）` }
+  }
+  if (!Number.isFinite(cRows) || cRows < 1 || cRows > 30) {
+    return { state: 'invalid', profile, keys, reason: `maxRows=${String(profile.capacity?.maxRows)} 越界（允许 1~30）` }
+  }
+
+  // ── 同名不同内容：digest 是模型文件的指纹，比"模型名字照应"可靠得多 ──
+  const warns = []
+  const expDigest = String(expected.modelDigest ?? '').trim().toLowerCase()
+  const gotDigest = String(profile.env?.modelDigest ?? '').trim().toLowerCase()
+  if (expDigest && gotDigest && expDigest !== gotDigest) {
+    return {
+      state: 'stale',
+      profile,
+      keys,
+      reason: `"${key}" 档案里的 digest ${gotDigest.slice(0, 12)}… ≠ 本机 ${expDigest.slice(0, 12)}…（**同名不同内容**）`,
+    }
+  }
+  if (expDigest && !gotDigest) {
+    warns.push('档案没记 modelDigest，无法确认"同名同内容"（建议重校一次或补上 digest）')
+  }
+  const expVer = String(expected.ollamaVersion ?? '').trim()
+  const gotVer = String(profile.env?.ollamaVersion ?? '').trim()
+  if (expVer && gotVer && expVer !== gotVer) {
+    warns.push(`Ollama 版本变了（档案 ${gotVer} → 本机 ${expVer}），引擎行为可能有别`)
+  }
+  const gotMachine = String(profile.env?.machineHash ?? '').trim()
+  if (MACHINE_HASH && gotMachine && gotMachine !== MACHINE_HASH) {
+    warns.push('这份档案来自**另一台机器**（digest 一致 → 参数仍然适用；建议做一次抽样复核，别直接盲信）')
+  }
+  return { state: 'calibrated', profile, keys, warn: warns.length ? warns.join('；') : undefined }
 }
 
 /** 读模型声明的上下文窗口（拿不到就返回 null —— 不猜）。 */
@@ -139,7 +223,14 @@ function calibrationTemplate() {
         '<provider>::<模型 id>': {
           calibratedAt: '<ISO 时间>',
           calibratedBy: '<DSH 会话 / 模型>',
-          env: { endpoint: '<端点>', ollamaVersion: '<版本>', gpu: '<显卡>', vramGB: 0 },
+          env: {
+            endpoint: '<端点>',
+            ollamaVersion: '<版本>',
+            gpu: '<显卡>',
+            vramGB: 0,
+            machineHash: MACHINE_HASH,
+            modelDigest: '<该模型的 digest，见 ollama_local_models 输出；用于识别"同名不同内容">',
+          },
           capacity: { contextWindow: 32768, maxChars: 60000, chunkLines: 40, maxRows: 12 },
           evidence: {
             throughputTokPerSec: 0,
@@ -168,6 +259,7 @@ export function renderCalibration(cal, ctxWindow = null) {
       `[校准] ✅ **本模型**已有档案（${cal.profile?.calibratedAt ?? '时间未知'}）\n` +
       `  容量：上下文 ${c.contextWindow ?? '?'} / 素材上限 ${c.maxChars ?? '?'} 字符 / 一口 ${c.chunkLines ?? '?'} 行 / 输出 ${c.maxRows ?? '?'} 行\n` +
       `  本机档案（${keys.length}）：${keys.join('、')}\n` +
+      (cal.warn ? `  ⚠️ ${cal.warn}\n` : '') +
       '  这些值会作为**默认参数**生效（调用时显式传参仍可覆盖）。'
     )
   }
@@ -713,6 +805,7 @@ export async function probe(baseURL) {
   for (const m of list) {
     const row = {
       id: m.name,
+      digest: m.digest ?? null,
       gb: m.size ? +(m.size / 1024 ** 3).toFixed(2) : null,
       params: m.details?.parameter_size ?? '',
       quant: m.details?.quantization_level ?? '',
@@ -866,9 +959,18 @@ export function apply(ctx, rawConfig) {
       },
       execute: async () => {
         const now = live()
-        const ctxWindow = now.model ? await modelContextWindow(ctx.get('llm'), now.provider, now.model) : null
-        const cal = await readCalibration({ provider: now.provider, model: now.model, contextWindow: ctxWindow })
         const body = renderStatus(await probe(resolveBaseURL(now.baseURL)))
+        const hit = (await probe(resolveBaseURL(now.baseURL)).catch(() => null))?.models?.find(
+          (m) => m.id === now.model || m.id === `${now.model}:latest`,
+        )
+        const ctxWindow = now.model ? await modelContextWindow(ctx.get('llm'), now.provider, now.model) : null
+        const cal = await readCalibration({
+          provider: now.provider,
+          model: now.model,
+          contextWindow: ctxWindow,
+          modelDigest: hit?.digest ?? null,
+          ollamaVersion: null,
+        })
         return [
           body,
           renderCalibration(cal, ctxWindow),
@@ -975,7 +1077,14 @@ export function apply(ctx, rawConfig) {
         const mode = MODES[modeKey]
         // 校准标识（v1.10.0）：有效则覆盖三个"机器相关"默认值 —— 素材上限 / 一口行数 / 输出行数
         const ctxWindow = now.model ? await modelContextWindow(ctx.get('llm'), now.provider, now.model) : null
-        const cal = await readCalibration({ provider: now.provider, model: now.model, contextWindow: ctxWindow })
+        const dig = now.model ? await digestOf(resolveBaseURL(now.baseURL), now.model).catch(() => null) : null
+        const cal = await readCalibration({
+          provider: now.provider,
+          model: now.model,
+          contextWindow: ctxWindow,
+          modelDigest: dig?.digest ?? null,
+          ollamaVersion: dig?.ollamaVersion ?? null,
+        })
         const tuned =
           cal.state === 'calibrated'
             ? {
@@ -990,7 +1099,8 @@ export function apply(ctx, rawConfig) {
             : { maxChars: mode.maxChars, chunkLines: mode.chunkLines, maxRows: mode.maxRows }
         const capacityNote =
           cal.state === 'calibrated'
-            ? `[容量] 已校准（模型 ${now.model}）：上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines || '不分批'} 行 / 输出 ${tuned.maxRows} 行`
+            ? `[容量] 已校准（模型 ${now.model}）：上限 ${tuned.maxChars} 字符 / 一口 ${tuned.chunkLines || '不分批'} 行 / 输出 ${tuned.maxRows} 行` +
+              (cal.warn ? `\n[容量提示] ${cal.warn}` : '')
             : `[容量] ${
                 cal.state === 'missing'
                   ? `本模型未校准（${cal.reason}）`
