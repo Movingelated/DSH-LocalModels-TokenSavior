@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-localmodels-tokensavior",
-  "version": "1.13.0",
+  "version": "1.14.0",
   "private": true,
   "type": "module",
   "description": "DSH-LocalModels-TokenSavior —— 在设置里提供独立的「本地模型」栏目：面板可直接开关与选择模型（volatile Config），并把只读采集任务委派给本地 Ollama 模型执行（原文不进上下文、只回结论）。用法/前置/验收纪律见 README.md。",

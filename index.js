@@ -699,17 +699,28 @@ function bigReadNudge(chars) {
  * 为什么不是 `import z from '@deepseek-ai/schemastery'`：
  * 本插件以 link: 方式装进 profile，模块的真实路径在工作区里，Node 的 ESM 会从真实
  * 路径向上找 node_modules，永远找不到 profile 的依赖树（实测 ERR_MODULE_NOT_FOUND，
- * 上一次装载失败正是它）。这里改用 createRequire，以「dsh 安装目录 / profile 目录」
- * 为基准做一次 CJS 解析：同步、不联网、不落盘；解析不到就降级为"无 Config"
- * （面板会如实说明原因），而不是让整个插件装载失败。
+ * 上一次装载失败正是它）。这里改用 createRequire，按下列顺序依次试，命中即用：
+ *   ① **DSH 入口文件本身**（dsh@0.2.0-rc.2 起的关键：改成全局 npm 安装后，schemastery 位于
+ *      `<dsh>/node_modules/@deepseek-ai/`，用"最后一个 node_modules + /index.js"那套推不出来
+ *      —— 实测那条会 `Cannot find module`，而直接拿入口文件当基准能解析到）
+ *   ② 旧式推导：入口路径里最后一个 `node_modules` 的父级（兼容 npx 缓存那类扁平布局）
+ *   ③ profile 目录（shell / 自检环境里有 `DSH_PROFILE_DIR`；**宿主进程自己的 env 里可能没有**，
+ *      所以只当兜底）
+ *   ④ 由 `DSH_HOME` + `DSH_PROFILE` 推出的 profile 目录（同 ③ 的兜底）
+ * 全程同步、不联网、不落盘；一个都解析不到就降级为"无 Config"（面板会如实说明原因），
+ * 而不是让整个插件装载失败。
  */
 function loadSchemastery() {
   const bases = []
   const entry = String(process.argv[1] ?? '')
+  if (entry) bases.push(entry)
   const at = entry.lastIndexOf('node_modules')
   if (at > 0) bases.push(path.join(entry.slice(0, at + 'node_modules'.length), 'index.js'))
   const profileDir = String(process.env.DSH_PROFILE_DIR ?? '').trim()
   if (profileDir) bases.push(path.join(profileDir, 'index.js'))
+  const home = String(process.env.DSH_HOME ?? '').trim()
+  const profName = String(process.env.DSH_PROFILE ?? '').trim()
+  if (home && profName) bases.push(path.join(home, 'profiles', profName, 'index.js'))
   for (const base of bases) {
     try {
       const z = createRequire(base)('@deepseek-ai/schemastery')
@@ -1009,13 +1020,10 @@ export function apply(ctx, rawConfig) {
     ctx.tools.register({
       name: toolName,
       description:
-        `把一个只读的信息采集任务交给本地 Ollama 模型执行，不消耗云端 token。` +
-        '适用：读大文件后只回结论、扫日志找关键行、统计计数、图片转文字。' +
-        '不适用：写文件、改代码、架构判断、产出最终交付文案。' +
-        '本地模型在独立上下文里工作，看不到本对话，因此 prompt 必须自包含；只有它的结论会回到这里。' +
-        '触发条件（命中任一就该用本工具，而不是自己 read）：单个文件 > 30 KB、要扫 ≥3 个文件/日志、' +
-        '或任务本质是计数 / 去重 / 字段抽取 / 找关键行 / 图片转文字。' +
-        '用法与验收纪律见插件 README.md（路径见 ollama_local_models 的输出）。',
+        `把一个**只读**采集任务交给本机 Ollama 模型执行 —— 它在独立上下文里工作、看不到本对话，` +
+        '只有结论回到这里：**原文不进你的上下文，也不消耗云端 token**。（该派什么、不该派什么，见系统提示词里的委派政策。）' +
+        '调用时给 task + kind + collect；输出格式、素材策略与验收要求由插件按类型套好。' +
+        '拿回结论按插件 README §6 复核：**分类与行号可信，计数必须自己数**。说明书路径见 ollama_local_models 的输出。',
       parameters: {
         type: 'object',
         properties: {

@@ -1,7 +1,7 @@
 ---
 doc: usage-declaration
 plugin: "@local/dsh-localmodels-tokensavior"
-version: 1.13.0
+version: 1.14.0
 audience: AI agent（人类也可直接阅读）
 purpose: 让任何一台刚装上本插件的机器上的 AI，无需历史对话即可正确启用、使用并验收本插件
 host-tools: [ollama_local_models, subagent_local]
@@ -655,7 +655,17 @@ TOTAL=91
 2. **配置走 volatile**：只有 `Schema.volatile()` 字段才会出现在设置表单并被写入接口接受；
    改完即时生效、不重挂插件。非 volatile 字段只在 patch 里改。
 3. **零裸 import**：插件以 `link:` 安装，模块真实路径在工作区，Node 从真实路径向上找不到 profile 的依赖树
-   （实测 `ERR_MODULE_NOT_FOUND`）。需要 schemastery 时用 `createRequire` 以 dsh 安装目录 / profile 目录为基准解析。
+   （实测 `ERR_MODULE_NOT_FOUND`）。需要 schemastery 时用 `createRequire` 解析，**基准要按顺序依次试**：
+
+   | 顺序 | 基准 | 为什么需要它 |
+   |---|---|---|
+   | ① | **DSH 入口文件本身**（`process.argv[1]`） | **dsh@0.2.0-rc.2 起的关键**：DSH 改成全局 npm 安装后，schemastery 位于 `<dsh>/node_modules/@deepseek-ai/`，"取最后一个 `node_modules` 再拼 `/index.js`"那套会推到 `…\npm\node_modules\index.js`，实测 `Cannot find module` ✗；而直接拿入口文件当基准就能沿 Node 的正常解析链找到 ✓ |
+   | ② | 入口路径里最后一个 `node_modules` 的父级 | 兼容 npx 缓存那类扁平布局（0.2.0 之前就是它在起作用） |
+   | ③ | `DSH_PROFILE_DIR/index.js` | shell / 自检环境里可用；**但宿主进程自己的 `process.env` 里可能没有这些变量**（实测），所以只能当兜底 |
+   | ④ | `DSH_HOME/profiles/<DSH_PROFILE>/index.js` | 同 ③ 的兜底 |
+
+   判定"修好了"的方法：模拟新布局（清掉 `DSH_*` 环境变量、把 `argv[1]` 设成 `<dsh>/lib/bin.js`）后
+   import 本插件，`Config` 必须仍能导出且 `schema.toJSON()` 可用 —— 那才是"设置页可写"。
 4. **前端护栏**：React Hook 只能在组件函数体内（在 `factory` 里调用组件会让整棵前端树崩掉）；
    面板要包 ErrorBoundary；`remote` 的命名空间必须逐个显式 `inject`。
 5. **异步流程不许在模块加载期跑**：加载期零副作用，全部进 `apply()`。
