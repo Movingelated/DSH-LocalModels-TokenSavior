@@ -18,6 +18,51 @@ integrity: 本文件与 package.json 的 version 应当一致；不一致说明�
 
 **DSH-LocalModels-TokenSavior**（本地模型子代理）· 使用声明 ｜ DSH 插件 ｜ 设置页在「设置 → 本地模型」
 
+---
+
+> ## ⚠ 本仓库是 fork，不是原项目
+>
+> 上游：[`Movingelated/DSH-LocalModels-TokenSavior`](https://github.com/Movingelated/DSH-LocalModels-TokenSavior)（MIT，© 2026 Movingelated）
+>
+> 本 fork 的**唯一目的**：适配 **DSH 0.2.1-rc.2**。上游 v1.14.0 面向 0.2.0-rc.2，
+> 而 0.2.1 里 `subagents.start()` 已不存在（`index.js:328`/`:331` 会直接 `start is not a function`）。
+>
+> **改了什么**
+>
+> 1. `startChild()` 改为**直连 `ctx.llm.stream`**，不再创建子代理 —— 原因见下节。
+> 2. 因为请求里**不携带任何工具**，`kind: "code"` 与**不带 `collect` 的调用**已被显式拦截并报错。
+>    （上游那两条路径靠子代理自己 `read`/`grep`，在本 fork 里不可用 —— 宁可报错，也不让它编造带出处的假结果。）
+> 3. 修正文档口径：**计数与行号都不可信**（实测它会把日志里的进程号当成行号）；
+>    素材规模阈值改为按**行数**表述（原文档按 token 表述，与自测的「115 行 59%」差一到两个数量级）。
+> 4. 每条结果末尾追加一行 `[复查]` 提示。
+>
+> **用之前必须知道**
+>
+> - **只能用 `collect` 模式**：`subagent_local({ task, kind, collect: { path: "<绝对路径>" } })`
+> - **宿主模型要有足够上下文**：默认 4096 装不下。本机做法是给 Ollama 建一个带 `num_ctx` 的派生模型，
+>   否则会报 `request (N tokens) exceeds the available context size (4096 tokens)`
+> - **未做完整回归**：仅在本机（DSH 0.2.1-rc.2 / Ollama 0.40.2 / RTX 5060 Laptop 8 GB / DeepSeek-7B-Q4）验证过
+
+### 为什么不用子代理（本 fork 的核心差异）
+
+在 DSH 0.2.1 上实测，一个子代理请求的 **33,959 token** 里，只有 **1,151 字符（0.8%）** 是本插件自己的任务，
+其余 **74.4%** 是父会话的完整系统提示。后果有两个：
+
+1. 7B 级本地模型会被那 10 万字符的「云端 agent 人设」带偏 ——
+   实测让它归类 `.gitignore`，它回了一堆「函数参数类型错误、状态管理」的建议；
+2. 每一片素材都要先把这 3.4 万 token 重读一遍，单次 27~83 秒。
+
+改成直连后（数据来自 Ollama `server.log` 的 `prompt eval` 记录）：
+
+| | 走子代理 | 直连 |
+|---|---|---|
+| 每次读的 prompt | 33,959 token | **565 ~ 1,698 token** |
+| 读 prompt 耗时 | 约 27 秒 | **0.4 ~ 1.0 秒** |
+| 子代理会话 | 每次新建一个 | 不产生 |
+| 只读保证 | 靠 deny 名单 | 请求里没有工具，结构性保证 |
+
+---
+
 > 让它**调用本机 Ollama 模型当"子代理"用**，干一些它力所能及的活（读大文件、扫日志、归类、抽取、问答、看图）
 > —— **原文不进你的上下文、只有结论回来**，帮你省下一些大白饭（token）。
 >

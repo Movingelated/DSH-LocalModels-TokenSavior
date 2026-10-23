@@ -298,6 +298,9 @@ export function renderCalibration(cal, ctxWindow = null) {
  * ⚠ 语义陷阱：`tools.restrict()` 对名单里**任何未注册的名字**都会直接抛错，
  *   allow 与 deny 一视同仁（dsh-tools：`names unknown global tool "x"; known global tools: ...`）。
  *   所以本名单是"尽力而为"——缺名字的部署会在 startChild() 里退化为不过滤，而不是让委派整个失败。
+ *
+ * ⚠ 2026-10-22 起改为直连 llm.stream，不再创建子代理，请求里**没有任何工具**，
+ *   只读性因此是结构性的。本名单保留作历史参考，当前代码不再使用它。
  */
 const READONLY_DENY = [
   'write',
@@ -312,47 +315,102 @@ const READONLY_DENY = [
 ]
 
 /**
- * 带只读过滤地起子代理 —— 名单里在本部署**不可 restrict** 的名字逐个剔除后重试；
- * 全部被剔除时退化为"不过滤"，并且**把结果如实告诉调用方**（不再静默降级）。
+ * 每次结果都附上的复查提示。
  *
- * 为什么要逐个剔除：`tools.restrict()` 只认"继承来的全局工具名"
- * （dsh-tools: view(scope).restrictableNames），名单里只要有一个不在该集合里，整条调用就抛错；
- * 一次剔除一批，才能保住其余防护。
- * 为什么不能静默：真机实测过一次静默降级 —— 子代理照样拿到 32 个工具，而调用方毫不知情。
+ * 为什么放在返回值里而不是只放系统提示：系统提示在 10 万字符的开头，容易被淹没；
+ * 这一行跟在结论后面，主模型读结论时同一屏就能看见，是最靠近决策点的位置。
+ *
+ * 依据（2026-10-22 实测）：让它统计 78 行日志的各类条数，报 TOTAL=60（真值 78），
+ * 且把日志里的 `(node:23172)` 当成 `dsh-web.log:23172` 当作出处。
+ */
+const RECHECK_NOTE =
+  '[复查] 本地模型的**计数与行号不可信**（实测会把日志里的进程号当成行号）；引用任何数字或出处前，请用 grep / wc 自己机械核对。'
+
+/**
+ * 直接调用 LLM 完成一次采集任务（本地改动，2026-10-22）。
+ *
+ * 为什么不再走子代理：DSH 0.2.1 会给每个子代理装配父会话的**完整系统提示**——
+ * 本机实测 system 段 108,207 字符、整条请求 33,959 token，而真正的任务只有 1,151 字符。
+ * 后果有两个：
+ *   ① 7B 本地模型被那 10 万字符的「云端 agent 人设」带偏（实测让它归类 .gitignore，
+ *      它回了一堆"函数参数类型错误、状态管理"的建议）；
+ *   ② 每一片素材都要先把这 3.4 万 token 重读一遍，单次 27~83 秒。
+ * 走 ctx.llm.stream 只发本插件自己拼的提示词（约 1.5k token），既不带壳、也不慢；
+ * 顺带把只读性从"靠 deny 名单约束"变成"结构上无工具可调"。
+ *
+ * 对调用方仍返回旧结构 { run: { result, dispose }, note }，调用方零改动。
+ *
+ * @param {unknown} subagents - 已不使用，保留形参只为调用方零改动
+ * @param {object} ctx - 插件上下文，用于取 llm 服务
+ * @param {object} spec - { prompt, parent, signal, agentOptions: { provider, model } }
+ * @param {string[]} extraDeny - 已不使用（无工具可禁）
  */
 async function startChild(subagents, ctx, spec, extraDeny = []) {
-  let deny = [...READONLY_DENY, ...extraDeny]
-  const dropped = []
-  for (;;) {
-    if (deny.length === 0) {
-      return { run: await subagents.start('spawn', spec), note: readonlyNote(dropped, true) }
-    }
-    try {
-      const run = await subagents.start('spawn', { ...spec, toolFilter: { deny } })
-      return { run, note: dropped.length > 0 ? readonlyNote(dropped, false) : undefined }
-    } catch (e) {
-      const message = String(e?.message ?? '')
-      if (!/unknown global tool/i.test(message)) throw e
-      // 报错形如：tools.restrict() names unknown global tool "x", "y"; known global tools: a, b, ...
-      // 只有"未知"的名字带引号，所以引号里的就是本轮要剔掉的。
-      const unknown = [...message.matchAll(/"([^"]+)"/g)]
-        .map((m) => m[1])
-        .filter((n) => deny.includes(n))
-      if (unknown.length === 0) throw e
-      deny = deny.filter((n) => !unknown.includes(n))
-      dropped.push(...unknown)
-      ctx.logger?.warn?.(
-        `[local-ollama] 这些工具名在本部署不可 restrict，已从只读名单剔除后重试：${unknown.join(', ')}`,
-      )
+  const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
+  if (!llm || typeof llm.stream !== 'function') {
+    throw new Error('llm 服务不可用（缺 stream 方法），无法直接调用本地模型')
+  }
+
+  const ao = spec?.agentOptions ?? {}
+  const provider = typeof ao.provider === 'string' ? ao.provider : ''
+  const model = typeof ao.model === 'string' ? ao.model : ''
+  if (!provider || !model) throw new Error('缺少 provider / model，无法调用本地模型')
+
+  // spec.prompt 是内容块数组 [{ type:'text', text }]；拼成一段纯文本发出去。
+  const blocks = Array.isArray(spec?.prompt) ? spec.prompt : []
+  const prompt = blocks
+    .map((b) => (b && typeof b.text === 'string' ? b.text : ''))
+    .join('\n')
+    .trim()
+  if (!prompt) throw new Error('提示词为空，无法调用本地模型')
+
+  const sessionId = spec?.parent?.session?.id
+  const options = {
+    provider,
+    model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+    maxTokens: 4096,
+    ...(sessionId ? { sessionId } : {}),
+    ...(spec?.signal ? { signal: spec.signal } : {}),
+  }
+
+  // 流式累加：只收正文（text-delta）。reasoning-delta 是模型的自言自语，混进结果会污染结论。
+  let streamed = ''
+  const finished = []
+  let stopReason = 'stop'
+  let failure
+  for await (const chunk of llm.stream(options)) {
+    if (!chunk || typeof chunk !== 'object') continue
+    if (chunk.type === 'text-delta') {
+      if (typeof chunk.text === 'string') streamed += chunk.text
+    } else if (chunk.type === 'block-end') {
+      const b = chunk.block
+      if (b && b.type === 'text' && typeof b.text === 'string') finished.push(b.text)
+    } else if (chunk.type === 'finish') {
+      const kind = chunk.reason?.kind
+      if (kind === 'error' || kind === 'aborted') {
+        stopReason = kind
+        failure = chunk.reason?.failure
+      }
     }
   }
-}
 
-/** 只读过滤没能完全生效时，附在结果末尾的说明。 */
-function readonlyNote(dropped, all) {
-  return all
-    ? '⚠ 只读过滤未生效：本部署拒绝了整份 deny 名单，子代理拿到的是全部工具，只读性仅由任务约束保证。'
-    : `⚠ 只读过滤未完全生效：${dropped.join(', ')} 在本部署不可 restrict、已从名单剔除，子代理仍可使用这几个工具。`
+  const text = streamed.trim() || finished.join('\n').trim()
+  const why = failure === void 0 ? '' : `：${failure.message ?? failure.code ?? '未知错误'}`
+  return {
+    run: {
+      result: {
+        output: [
+          {
+            type: 'text',
+            text: text || `（本地模型没有返回文本；stopReason=${stopReason}${why}）`,
+          },
+        ],
+      },
+      dispose: async () => {},
+    },
+    note: undefined,
+  }
 }
 
 /** 把一个只含 `*` / `?` 的文件名 glob 编译成正则（零依赖）。 */
@@ -668,14 +726,17 @@ const DELEGATION_POLICY =
   '抽出来之后"怎么归类、怎么解释"这部分才值得派（机械的交给 shell，语义的交给它）。\n' +
   '· **需要语义理解**（归因、语义归类、摘要、问答、翻译、看图）→ **优先派**，别把原文读进主上下文。\n' +
   '规模只决定"值不值得"：单个文件 > 30 KB、或要扫 ≥ 3 个文件/日志时，派它能省下可观的上下文。\n' +
-  '素材 > 32K token（≈100 KB）时**必须**先收窄：最有效的做法是先用 grep / pwsh 把大素材**去重归一化**成小文件再交给它' +
-  '（实测 1.7 MB → 84 行），或者让 collect.pattern 只取匹配行 —— 本地模型只有 32K 上下文，整份塞进去会被截成残料。\n' +
+  '**素材规模直接决定结论质量**：命中超过约 50 行就要预期间确率下降，超过 100 行结论只能当线索' +
+  '（插件自测：33 行 100%、115 行 59%）。所以先用 grep / pwsh 把大素材**去重归一化**成小文件再交给它' +
+  '（实测 1.7 MB → 84 行），或者让 collect.pattern 只取匹配行；' +
+  '另外本地模型的上下文窗口有限，整份大文件塞进去会被截成残料。\n' +
   '**换机器/换模型后首次使用前**：先按插件 README §5.7 跑一遍「四步容量校准」（读上下文窗口 / 量吞吐 / 三点测"一口多少行" / 测哪几种 kind 可用），' +
   '把结果写进插件目录的 calibration.json（**先读再合并**，只动本模型那一条）；' +
   '**若该文件里已有本模型的档案且上下文未变，直接用里面的参数、不要重复校准** —— ' +
   '同机换模型只需给新模型校准，**换回来直接用旧档案**（ollama_local_models 的输出会显示本模型的档案状态）。\n' +
   '派法：subagent_local({ kind, task, collect })，collect 给绝对路径；拿回结论后按插件 README §6 复核' +
-  '（**分类与行号可信，计数必须自己数**）。若手上没有 subagent_local 工具、或它报"已关闭"，就照常自己读文件，忽略本节。'
+  '（**只有分类边界可参考；计数与行号一律不可信** —— 实测它会把日志里的进程号当成行号，' +
+  '引用任何数字或出处前，必须用 grep / wc 自己机械核）。若手上没有 subagent_local 工具、或它报"已关闭"，就照常自己读文件，忽略本节。'
 
 /** 触发"读大文件"提示的阈值（字符数）。 */
 const BIG_READ_CHARS = 30000
@@ -1020,10 +1081,13 @@ export function apply(ctx, rawConfig) {
     ctx.tools.register({
       name: toolName,
       description:
-        `把一个**只读**采集任务交给本机 Ollama 模型执行 —— 它在独立上下文里工作、看不到本对话，` +
+        `把一个**只读**采集任务交给本机 Ollama 模型执行 —— 它只收到本次任务与素材、看不到本对话，` +
         '只有结论回到这里：**原文不进你的上下文，也不消耗云端 token**。（该派什么、不该派什么，见系统提示词里的委派政策。）' +
         '调用时给 task + kind + collect；输出格式、素材策略与验收要求由插件按类型套好。' +
-        '拿回结论按插件 README §6 复核：**分类与行号可信，计数必须自己数**。说明书路径见 ollama_local_models 的输出。',
+        '拿回结论按插件 README §6 复核：**只有分类边界可参考；计数与行号一律不可信**' +
+        '（实测它会把日志里的进程号当成行号），引用任何数字或出处前必须用 grep / wc 自己机械核对。' +
+        '**最容易出错的是"要它统计数字 / 要它给出处"这类任务 —— 能不要求就别要求。**' +
+        '说明书路径见 ollama_local_models 的输出。',
       parameters: {
         type: 'object',
         properties: {
@@ -1162,9 +1226,28 @@ export function apply(ctx, rawConfig) {
               `当前：${kind.label} / ${mode.label}`,
           )
         }
+        // ── 直连实现的边界拦截（本地改动 2026-10-23）────────────────────────
+        // 本实现直连 llm.stream，请求里**不携带任何工具**。原插件有两类用法依赖"模型自己取数"，
+        // 在这里会退化成"提示词叫它去 read / grep，它其实什么都读不到" → 静默编造带出处的假结果。
+        // 宁可明确报错，也不给编造的机会。
+        if (!manualPrompt && kindKey === 'code') {
+          throw new Error(
+            'code 类型在本实现下不可用：它的提示词要求模型自己用 read / grep 检索代码，' +
+              '而直连请求不携带任何工具 —— 它只会凭空编出「文件:行号」。' +
+              '请改用 kind: "extract" 或 "summary" 并给 collect 路径，由宿主预取素材。',
+          )
+        }
+        if (!manualPrompt && !args?.collect) {
+          throw new Error(
+            '本实现只支持 collect 模式：模型的取数工具已被移除，它无法自己读文件。' +
+              '请给 collect: { path: "<绝对路径>" }（可配 pattern / maxChars 收窄）；' +
+              '若确实要发一段完全自包含的提示词，请改用 prompt 参数。',
+          )
+        }
+
+        // 子代理服务已不再使用（startChild 直连 llm）；这里只保留形参兼容，不再因它缺席而拒绝服务。
+        const subagents = subagentsOf() ?? null
         const verifyNote = `[验收建议] ${kind.verify}`
-        const subagents = subagentsOf()
-        if (!subagents) throw new Error('subagents 服务不可用，无法委派')
 
         // 前置自检：把 UNKNOWN_MODEL / 路由缺失这类"看不懂的报错"提前变成可执行的指引
         const check = await checkRoute(ctx.get('llm'), now.provider, model)
@@ -1280,6 +1363,7 @@ export function apply(ctx, rawConfig) {
             mergeNote,
             ...partials.map((p) => p.note).filter(Boolean),
             verifyNote,
+            RECHECK_NOTE,
             capacityNote,
           ].filter(Boolean)
           return `${merged}\n\n${[...new Set(notes)].join('\n')}`
@@ -1341,7 +1425,9 @@ export function apply(ctx, rawConfig) {
         const tSingle = Date.now()
         const out = await runOnce(childPrompt, baseLabel, extraDeny)
         const timingNote = `[耗时] ${((Date.now() - tSingle) / 1000).toFixed(1)} 秒（1 次本地推理）`
-        const notes = [materialNote, capacityNote, out.note, verifyNote, timingNote].filter(Boolean).join('\n')
+        const notes = [materialNote, capacityNote, out.note, verifyNote, RECHECK_NOTE, timingNote]
+          .filter(Boolean)
+          .join('\n')
         return notes ? `${out.text}\n\n${notes}` : out.text
       },
     }),
